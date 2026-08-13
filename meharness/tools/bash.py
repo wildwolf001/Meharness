@@ -72,14 +72,42 @@ class Bash(Tool):
 
 
     async def execute(self, params: Params) -> ToolResult:
+        import os
+        import shutil
+        import sys
+
         timeout = min(params.timeout, MAX_TIMEOUT)
 
+        # Windows 上 `asyncio.create_subprocess_shell` 默认用 cmd.exe，而 agent 按
+        # bash 语法写命令（ls/find/管道/环境变量），cmd 必然失败。有 git bash 时
+        # 用 `bash -c` 执行，保证 Unix 命令可用；否则退回 cmd。
+        executable = None
+        if sys.platform == "win32":
+            bash = shutil.which("bash")
+            if bash is None:
+                for cand in (
+                    r"C:\Program Files\Git\bin\bash.exe",
+                    r"C:\Program Files\Git\usr\bin\bash.exe",
+                ):
+                    if os.path.exists(cand):
+                        bash = cand
+                        break
+            if bash:
+                executable = bash
+
         try:
-            proc = await asyncio.create_subprocess_shell(
-                params.command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            if executable:
+                proc = await asyncio.create_subprocess_exec(
+                    executable, "-c", params.command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            else:
+                proc = await asyncio.create_subprocess_shell(
+                    params.command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
             proc.kill()
