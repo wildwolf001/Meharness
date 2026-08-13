@@ -1466,6 +1466,15 @@ class MeharnessApp(App):
                     classes="message ai-message",
                 )
                 await ai_row.mount(md)
+                # 状态保留：把被打断的部分回复写进会话，下一轮能基于它续接，
+                # 而不是当什么都没发生过（参照 claude-code 的优雅中断）。
+                try:
+                    if self.conversation is not None:
+                        self.conversation.add_assistant_message(
+                            accumulated_text + "\n\n[interrupted by user]"
+                        )
+                except Exception:
+                    pass
             self._show_system_message("Operation cancelled")
         except LLMError as e:
             self._show_error(str(e))
