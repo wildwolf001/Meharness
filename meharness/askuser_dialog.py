@@ -259,6 +259,15 @@ class InlineAskUserWidget(Vertical, can_focus=True):
         cursor = self._cursors[self._q_idx]
         options = self._questions[self._q_idx].get("options", [])
         if cursor != len(options):  # 当前光标不在 "Other" 上
+            key = event.key
+            # 数字快捷选择：1..N 直接选中对应选项（方向键在部分终端可能失灵）
+            if key.isdigit():
+                idx = int(key) - 1
+                if 0 <= idx < len(options):
+                    self._cursors[self._q_idx] = idx
+                    self._refresh()
+                    event.stop()
+                    return
             return
         key = event.key
         if key == "backspace":

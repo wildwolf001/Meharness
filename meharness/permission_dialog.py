@@ -32,6 +32,10 @@ class InlinePermissionWidget(Vertical, can_focus=True):
         Binding("down", "cursor_down", "Down", priority=True),
         Binding("enter", "select", "Select", priority=True),
         Binding("escape", "deny", "Deny", priority=True),
+        # 数字键快捷选择：即使方向键在部分终端（mintty）失灵也能操作
+        Binding("1", "option_1", "Yes", priority=True),
+        Binding("2", "option_2", "Yes Always", priority=True),
+        Binding("3", "option_3", "No", priority=True),
     ]
 
     class Responded(Message):
@@ -91,3 +95,15 @@ class InlinePermissionWidget(Vertical, can_focus=True):
 
     def action_deny(self) -> None:
         self.post_message(self.Responded(PermissionResponse.DENY))
+
+    def action_option_1(self) -> None:
+        self._cursor = 0
+        self.action_select()
+
+    def action_option_2(self) -> None:
+        self._cursor = 1
+        self.action_select()
+
+    def action_option_3(self) -> None:
+        self._cursor = 2
+        self.action_select()
