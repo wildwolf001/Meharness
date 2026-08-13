@@ -561,7 +561,7 @@ class MeharnessApp(App):
     INLINE_PADDING = 0
     theme = "meharness"
     BINDINGS = [
-        Binding("ctrl+c", "handle_ctrl_c", "Quit", priority=True),
+        Binding("ctrl+c", "handle_ctrl_c", "Interrupt", priority=True),
         Binding("escape", "cancel", "Cancel", priority=True),
         Binding("shift+tab", "cycle_mode", "Cycle mode", priority=True),
         Binding("ctrl+o", "toggle_tool_blocks", "Toggle tools", priority=True),
@@ -1015,6 +1015,11 @@ class MeharnessApp(App):
 
     async def _dispatch_command(self, text: str) -> None:
         name, args, is_command = parse_command(text)
+
+        # 退出：输入 exit / quit，或 /exit / /quit（Ctrl+C 只做中断/复制，不再退出）
+        if text.strip().lower() in ("exit", "quit") or name.lower() in ("exit", "quit"):
+            await self._request_exit()
+            return
 
         if not is_command:
             if self._streaming or self.agent is None:
@@ -1829,11 +1834,21 @@ class MeharnessApp(App):
             except Exception:
                 pass
             return
+        # 空闲时 Ctrl+C 不再退出——终端里 Ctrl+C 是复制，与退出语义冲突。
+        # 退出请输入 exit（或 /exit、/quit）。
+        self._show_system_message("Ctrl+C = 复制/中断；退出请输入 exit")
 
-        if getattr(self, "_exit_requested", False):
-            self.exit()
-            return
-        self._exit_requested = True
+    async def _request_exit(self) -> None:
+        """统一退出路径：先中断流式响应，再执行清理（记忆抽取、hooks、
+        MCP 关闭、团队清理、会话关闭），最后退出。"""
+        if self._streaming:
+            if self._agent_task and not self._agent_task.done():
+                self._agent_task.cancel()
+                try:
+                    await self._agent_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            self._finish_streaming()
 
         async def _cleanup() -> None:
             tasks: list[asyncio.Task] = []
