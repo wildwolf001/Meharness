@@ -100,6 +100,13 @@ class AgentTool(Tool):
         if p.team_name:
             return await self._execute_as_teammate(p)
 
+        # 论文专家唤醒：subagent_type 命中 AgentCard 注册表 → 走专家运行时
+        if p.subagent_type:
+            from meharness.agents.cards import REGISTRY
+            card = REGISTRY.get(p.subagent_type)
+            if card is not None:
+                return await self._execute_specialist(card, p)
+
         isolation = ""
         if p.subagent_type:
             defn = self._agent_loader.get(p.subagent_type)
@@ -636,6 +643,52 @@ class AgentTool(Tool):
 
         return ToolResult(output=result_text or "(sub-agent returned no output)")
 
+
+    async def _execute_specialist(self, card: Any, p: AgentToolParams) -> ToolResult:
+        """按 AgentCard 唤醒论文专家（完整 Agent 实例 + 独立工具注册表）。"""
+        from meharness.agents.spawn import build_specialist_agent
+
+        _base_registry = getattr(self._parent_agent, '_full_registry', None) or self._parent_agent.registry
+        sub_agent = build_specialist_agent(
+            card,
+            parent_agent=self._parent_agent,
+            parent_registry=_base_registry,
+        )
+
+        trace_node = self._trace_manager.create(
+            agent_type=card.name,
+            parent_id=self._parent_agent.agent_id,
+            trace_id=sub_agent.trace_id,
+        )
+        sub_agent.agent_id = trace_node.agent_id
+        agent_name = p.name or card.display_name
+
+        if p.run_in_background or card.background:
+            task_id = self._task_manager.launch(
+                agent=sub_agent,
+                task=p.prompt,
+                name=agent_name,
+            )
+            return ToolResult(output=(
+                f"专家「{card.display_name}」已在后台启动。\n"
+                f"Expert: {card.name}\n"
+                f"Task ID: {task_id}\n"
+                f"系统会在完成时自动通知。不要等待或轮询，先向用户报告当前进展。"
+            ))
+
+        try:
+            result_text = await sub_agent.run_to_completion(p.prompt)
+        except Exception as e:
+            self._trace_manager.complete(trace_node.agent_id, "failed")
+            return ToolResult(output=f"专家执行失败: {e}", is_error=True)
+
+        self._trace_manager.update(
+            trace_node.agent_id,
+            input_tokens=sub_agent.total_input_tokens,
+            output_tokens=sub_agent.total_output_tokens,
+        )
+        self._trace_manager.complete(trace_node.agent_id, "completed")
+        return ToolResult(output=result_text or "(专家无输出)")
 
     def _create_client_for_model(self, model_alias: str) -> LLMClient | None:
         if self._provider_config is None:

@@ -245,6 +245,7 @@ def build_system_prompt(
     skill_section: str = "",
     memory_section: str = "",
     work_dir: str = ".",
+    team_index: str = "",
 ) -> str:
     if coordinator_mode:
         from meharness.teams.coordinator import get_coordinator_system_prompt
@@ -259,6 +260,13 @@ def build_system_prompt(
     b.add(TONE_STYLE_SECTION)
     b.add(TEXT_OUTPUT_SECTION)
     b.add(environment_section(work_dir))
+
+    if team_index:
+        b.add(PromptSection(
+            name="TeamAwareness",
+            priority=75,
+            content=team_index,
+        ))
 
     if custom_instructions:
         b.add(PromptSection(

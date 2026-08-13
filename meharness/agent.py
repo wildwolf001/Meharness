@@ -402,6 +402,13 @@ class Agent:
         if catalog_list is not None:
             self._agent_catalog_list = catalog_list
 
+    def _team_awareness(self) -> str:
+        """仅顶层主 agent 注入论文团队感知；子代理/专家不注入（避免干扰专注）。"""
+        if self.parent_id is not None:
+            return ""
+        from meharness.agents.cards import build_team_awareness_prompt
+        return build_team_awareness_prompt()
+
     def _build_hook_context(self, event: str, **kwargs: str | dict) -> HookContext:
         return HookContext(
             event_name=event,
@@ -508,6 +515,7 @@ class Agent:
                 hook_prompts=hook_prompts,
                 coordinator_mode=self.coordinator_mode,
                 agent_catalog=self._agent_catalog_list or None,
+                team_index=self._team_awareness(),
             )
 
             if self.plan_mode:
@@ -1033,6 +1041,7 @@ class Agent:
         system = build_system_prompt(
             hook_prompts=hook_prompts,
             coordinator_mode=self.coordinator_mode,
+            team_index=self._team_awareness(),
         )
 
         tools = self.registry.get_all_schemas(self.protocol)

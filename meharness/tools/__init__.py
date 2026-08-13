@@ -149,6 +149,8 @@ def create_default_registry(file_cache: FileCache | None = None, file_history: A
     from meharness.tools.grep import Grep
     from meharness.tools.read_file import ReadFile
     from meharness.tools.write_file import WriteFile
+    from meharness.tools.web_search import WebSearch
+    from meharness.tools.web_fetch import WebFetch
 
     file_state_cache = FileStateCache()
 
@@ -159,4 +161,6 @@ def create_default_registry(file_cache: FileCache | None = None, file_history: A
     registry.register(Bash())
     registry.register(Glob())
     registry.register(Grep())
+    registry.register(WebSearch())
+    registry.register(WebFetch())
     return registry
