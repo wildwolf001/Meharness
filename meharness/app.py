@@ -601,6 +601,9 @@ class MeharnessApp(App):
         self._selected_provider: ProviderConfig | None = None
         self._streaming = False
         self._thinking_start: float = 0.0
+        self._thinking_widget: Static | None = None
+        self._thinking_accum = ""
+        self._thinking_expanded = False
         self._thinking_verb: str = ""
         self._spinner_idx: int = 0
         self._spinner_timer = None
@@ -1132,6 +1135,23 @@ class MeharnessApp(App):
         self._update_mode_label()
 
     def action_toggle_tool_blocks(self) -> None:
+        # 思考展开/折叠：Ctrl+O 在 "∴ Thinking…" 和全文之间切换（参照 claude）
+        from rich.text import Text as RichText
+        if self._thinking_widget is not None and self._thinking_accum:
+            if getattr(self, "_thinking_expanded", False):
+                t = RichText()
+                t.append("∴ Thinking… ", style="dim italic")
+                t.append("(ctrl+o)", style="dim")
+                self._thinking_widget.update(t)
+                self._thinking_expanded = False
+            else:
+                t = RichText()
+                t.append(self._thinking_accum, style="dim italic")
+                self._thinking_widget.update(t)
+                self._thinking_expanded = True
+            self.call_after_refresh(self._thinking_widget.scroll_end, animate=False)
+            return
+
         for block in self.query(ToolCallBlock):
             if block._loading:
                 continue
@@ -1274,8 +1294,8 @@ class MeharnessApp(App):
 
         accumulated_text = ""
         tool_blocks: dict[str, ToolCallBlock] = {}
-        thinking_widget: Static | None = None
-        thinking_accum = ""
+        self._thinking_widget: Static | None = None
+        self._thinking_accum = ""
 
         # 在聊天区底部启动持续旋转的加载动画
         self._thinking_start = _time.monotonic()
@@ -1301,15 +1321,16 @@ class MeharnessApp(App):
         try:
             async for event in self.agent.run(self.conversation):
                 if isinstance(event, ThinkingText):
-                    thinking_accum += event.text
-                    if thinking_widget is None:
+                    self._thinking_accum += event.text
+                    if self._thinking_widget is None:
                         from rich.text import Text as RichText
-                        thinking_widget = Static("", classes="message thinking-message")
-                        await ai_row.mount(thinking_widget)
+                        self._thinking_widget = Static("", classes="message thinking-message")
+                        await ai_row.mount(self._thinking_widget)
+                    # 折叠显示（像 claude 的 "∴ Thinking"），不滚动全文；Ctrl+O 展开
                     t = RichText()
-                    t.append("⟳ ", style="dim")
-                    t.append(thinking_accum, style="dim italic")
-                    thinking_widget.update(t)
+                    t.append("∴ Thinking… ", style="dim italic")
+                    t.append("(ctrl+o)", style="dim")
+                    self._thinking_widget.update(t)
                     self.call_after_refresh(chat.scroll_end, animate=False)
 
                 elif isinstance(event, StreamText):
