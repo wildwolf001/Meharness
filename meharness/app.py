@@ -735,6 +735,9 @@ class MeharnessApp(App):
         self.agent.file_history = self.file_history
         self.agent.session_id = self.session.session_id
 
+        from meharness.tools.run_pipeline import RunPaperPipelineTool
+        self.registry.register(RunPaperPipelineTool(self.agent))
+
         self._exit_plan_tool._is_plan_mode = lambda: self.agent.plan_mode
         self._exit_plan_tool._plan_exists = lambda: self.agent._get_plan_path().exists()
 
