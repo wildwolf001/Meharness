@@ -1383,6 +1383,9 @@ class MeharnessApp(App):
                 elif isinstance(event, PermissionRequest):
                     await self._handle_permission_request(event)
 
+                elif isinstance(event, AskUserEvent):
+                    await self._handle_askuser(event)
+
                 elif isinstance(event, ToolResultEvent):
                     block = tool_blocks.get(event.tool_id)
                     if block:

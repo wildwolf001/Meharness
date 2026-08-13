@@ -965,7 +965,26 @@ class Agent:
 
         try:
             params = tool.params_model.model_validate(tc.arguments)
-            result = await tool.execute(params)
+            # AskUserQuestion：先 yield AskUserEvent 让 app 挂载弹窗（否则 tool 阻塞
+            # 等 future，而 app 又要等 tool 完成才挂弹窗 → 死锁），再 await 回答。
+            if tool.name == "AskUserQuestion":
+                from meharness.tools.ask_user import AskUserEvent
+                loop = asyncio.get_running_loop()
+                future: asyncio.Future[dict[str, str]] = loop.create_future()
+                questions_data = [q.model_dump() for q in params.questions]
+                event = AskUserEvent(questions=questions_data, future=future)
+                tool._pending_event = event
+                yield event
+                try:
+                    answers = await asyncio.wait_for(future, timeout=300)
+                except asyncio.TimeoutError:
+                    answers = {}
+                lines = []
+                for q in params.questions:
+                    lines.append(f"{q.name}: {answers.get(q.name, '(no answer)')}")
+                result = ToolResult(output="\n".join(lines))
+            else:
+                result = await tool.execute(params)
         except ValidationError as e:
             result = ToolResult(
                 output=f"Parameter validation error: {e}", is_error=True
