@@ -106,7 +106,7 @@ COPY_COMMAND = Command(
     name="copy",
     description="复制最后一条 AI 回复到剪贴板",
     usage="/copy",
-    aliases=["c"],
+    aliases=["cp"],
     type=CommandType.LOCAL_UI,
     handler=handle_copy,
 )
