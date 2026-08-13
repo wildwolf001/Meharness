@@ -21,7 +21,20 @@ class Params(BaseModel):
 
 class Grep(Tool):
     name = "Grep"
-    description = "Search file contents using a regex pattern, returning file:line:content matches."
+    description = (
+        "A powerful search tool for file contents\n"
+        "\n"
+        "Usage:\n"
+        "- ALWAYS use Grep for search tasks. NEVER invoke `grep` or `rg` as a Bash command. The Grep tool has been "
+        "optimized for correct permissions and access.\n"
+        "- Supports full regex syntax (e.g., \"log.*Error\", \"function\\s+\\w+\")\n"
+        "- Filter files with the include parameter, a glob filter on filenames (e.g., \"*.py\", \"**/*.tsx\")\n"
+        "- Returns matches as `file:line:content` lines\n"
+        "- Use Agent tool for open-ended searches requiring multiple rounds\n"
+        "- Pattern syntax: Python regex - literal braces need escaping (use `interface\\{\\}` to find `interface{}` in "
+        "Go code)\n"
+        "- Matching is checked per line; patterns match within single lines only"
+    )
     params_model = Params
     category = "read"
     is_concurrency_safe = True

@@ -19,7 +19,14 @@ class Params(BaseModel):
 
 class Glob(Tool):
     name = "Glob"
-    description = "Find files matching a glob pattern, returning relative paths."
+    description = (
+        "- Fast file pattern matching tool that works with any codebase size\n"
+        "- Supports glob patterns like \"**/*.js\" or \"src/**/*.ts\"\n"
+        "- Returns matching file paths\n"
+        "- Use this tool when you need to find files by name patterns\n"
+        "- When you are doing an open ended search that may require multiple rounds of globbing and grepping, use the "
+        "Agent tool instead"
+    )
     params_model = Params
     category = "read"
     is_concurrency_safe = True
