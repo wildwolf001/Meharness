@@ -906,7 +906,9 @@ class MeharnessApp(App):
         chat_input = self.query_one("#chat-input", ChatInput)
         chat_input.placeholder = "Send a message..."
         chat_input.load_history(work_dir)
-        chat_input.focus()
+        # on_mount 同步阶段 focus() 在 Textual 8.x 下可能因组件未就绪而失效，
+        # 用 call_after_refresh 延到渲染刷新后聚焦，确保键盘输入能落在输入框上。
+        self.call_after_refresh(chat_input.focus)
 
         self._notification_check_task = asyncio.create_task(
             self._start_notification_polling()
