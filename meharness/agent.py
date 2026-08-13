@@ -555,9 +555,44 @@ class Agent:
                 append_replacement_records(self.session_dir, _new_records)
 
             collector = StreamCollector()
-            llm_stream = self.client.stream(api_conv, system=system, tools=tools)
-            async for event in collector.consume(llm_stream):
-                yield event
+            try:
+                llm_stream = self.client.stream(api_conv, system=system, tools=tools)
+                async for event in collector.consume(llm_stream):
+                    yield event
+            except Exception as _e:
+                # 响应式压缩：上下文超窗（413/context-length）→ 压缩后重试一次
+                from meharness.client import is_context_overflow_error
+                if is_context_overflow_error(_e):
+                    compact_result = await auto_compact(
+                        conversation, self.client, self.context_window, self.session_dir,
+                        protocol=self.protocol, breaker=self.compact_breaker,
+                        recovery=self.recovery_state,
+                        tool_schemas=self.registry.get_all_schemas(self.protocol),
+                        transcript_path=self._transcript_path,
+                    )
+                    if isinstance(compact_result, CompactEvent):
+                        conversation.inject_environment(env_context)
+                        yield CompactNotification(
+                            before_tokens=compact_result.before_tokens,
+                            message=(
+                                "上下文超窗，已自动压缩（压缩前 "
+                                f"{compact_result.before_tokens:,} tokens）"
+                            ),
+                            boundary=compact_result.boundary,
+                        )
+                        api_conv, _new_records = apply_tool_result_budget(
+                            conversation, self.session_dir, self.replacement_state
+                        )
+                        if _new_records:
+                            append_replacement_records(self.session_dir, _new_records)
+                        collector = StreamCollector()
+                        llm_stream = self.client.stream(api_conv, system=system, tools=tools)
+                        async for event in collector.consume(llm_stream):
+                            yield event
+                    else:
+                        raise _e
+                else:
+                    raise _e
 
             response = collector.response
 

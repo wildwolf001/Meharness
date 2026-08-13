@@ -87,6 +87,21 @@ class LLMError(Exception):
     pass
 
 
+def is_context_overflow_error(e: Exception) -> bool:
+    """判断异常是否为"上下文超窗"（HTTP 413 或 message 提示 context/token 超长）。
+
+    agent 循环用它触发响应式压缩并重试。
+    """
+    text = str(e).lower()
+    if "413" in text or "context length" in text or "context_length" in text:
+        return True
+    if ("context" in text and any(w in text for w in ("exceed", "too large", "too long", "maximum", "limit"))):
+        return True
+    if ("token" in text and any(w in text for w in ("exceed", "too long", "maximum", "limit"))):
+        return True
+    return False
+
+
 class AuthenticationError(LLMError):
     pass
 

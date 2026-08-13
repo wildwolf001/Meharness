@@ -520,10 +520,30 @@ class RecoveryState:
         return records
 
 
+def _is_cjk(ch: str) -> bool:
+    """判断是否为 CJK/全角字符（约占 1 token/字，而非 1 token/3.5 字符）。"""
+    o = ord(ch)
+    return (
+        0x4E00 <= o <= 0x9FFF      # CJK 统一表意
+        or 0x3400 <= o <= 0x4DBF   # CJK 扩展 A
+        or 0x20000 <= o <= 0x2A6DF  # CJK 扩展 B
+        or 0xF900 <= o <= 0xFAFF   # CJK 兼容
+        or 0xFF00 <= o <= 0xFFEF   # 全角形式
+        or 0xAC00 <= o <= 0xD7AF   # 谚文
+        or 0x3040 <= o <= 0x30FF   # 平假名/片假名
+    )
+
+
 def _approx_tokens(s: str) -> int:
+    """CJK 感知的 token 估算：中文/全角 ≈ 1 token/字，其他 ≈ 1 token/3.5 字符。
+
+    对中文会话比简单 len/4 准确得多——避免因低估 token 导致压缩时机过晚。
+    """
     if not s:
         return 0
-    return int(len(s) / _RECOVERY_CHARS_PER_TOKEN)
+    cjk = sum(1 for ch in s if _is_cjk(ch))
+    other = len(s) - cjk
+    return int(cjk + other / _RECOVERY_CHARS_PER_TOKEN)
 
 
 def _truncate_by_tokens(s: str, token_budget: int) -> str:
