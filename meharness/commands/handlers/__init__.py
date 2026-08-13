@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from meharness.commands.handlers.clear import CLEAR_COMMAND
+from meharness.commands.handlers.copy import COPY_COMMAND
 from meharness.commands.handlers.compact import COMPACT_COMMAND
 from meharness.commands.handlers.help import HELP_COMMAND
 from meharness.commands.handlers.mcp import MCP_COMMAND
@@ -23,6 +24,7 @@ ALL_COMMANDS = [
     HELP_COMMAND,
     COMPACT_COMMAND,
     CLEAR_COMMAND,
+    COPY_COMMAND,
     PLAN_COMMAND,
     SESSION_COMMAND,
     MCP_COMMAND,
