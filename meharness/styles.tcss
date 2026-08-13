@@ -68,6 +68,12 @@ Screen { }
     padding: 0 2;
 }
 
+.thinking-message {
+    color: $text-muted;
+    padding: 0 2;
+    max-height: 8;
+}
+
 .system-message {
     color: $text-muted;
     padding: 0 2;

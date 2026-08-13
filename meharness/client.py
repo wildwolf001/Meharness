@@ -478,6 +478,9 @@ class OpenAICompatClient(LLMClient):
         # 用于累积 streaming tool call 的状态。Chat Completions 流按
         # tool_calls 列表中的位置索引下发 delta，我们按索引跟踪每个进行中的调用。
         active_calls: dict[int, dict[str, str]] = {}  # 索引 -> {id, name, args}
+        # 思考内容（DeepSeek 等通过 reasoning_content 下发）：累积并在正文开始时收尾。
+        thinking_accum = ""
+        thinking_flushed = False
 
         try:
             response = await self._client.chat.completions.create(**kwargs)
@@ -506,8 +509,18 @@ class OpenAICompatClient(LLMClient):
                 choice = chunk.choices[0]
                 delta = choice.delta
 
+                # --- 思考内容（DeepSeek reasoning_content）---
+                if delta and getattr(delta, "reasoning_content", None):
+                    thinking_accum += delta.reasoning_content
+                    yield ThinkingDelta(text=delta.reasoning_content)
+                    continue
+
                 # --- 文本内容 ---
                 if delta and delta.content:
+                    # 思考结束：先收尾思考块
+                    if thinking_accum and not thinking_flushed:
+                        thinking_flushed = True
+                        yield ThinkingComplete(thinking=thinking_accum, signature="")
                     yield TextDelta(text=delta.content)
 
                 # --- tool call 增量 ---
@@ -532,6 +545,10 @@ class OpenAICompatClient(LLMClient):
 
                 # --- 结束原因 ---
                 if choice.finish_reason in ("tool_calls", "stop"):
+                    # 思考未收尾（如直接进 tool call）→ 补发 ThinkingComplete
+                    if thinking_accum and not thinking_flushed:
+                        thinking_flushed = True
+                        yield ThinkingComplete(thinking=thinking_accum, signature="")
                     if choice.finish_reason == "tool_calls":
                         for _idx, call in sorted(active_calls.items()):
                             try:

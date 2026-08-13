@@ -1274,6 +1274,8 @@ class MeharnessApp(App):
 
         accumulated_text = ""
         tool_blocks: dict[str, ToolCallBlock] = {}
+        thinking_widget: Static | None = None
+        thinking_accum = ""
 
         # 在聊天区底部启动持续旋转的加载动画
         self._thinking_start = _time.monotonic()
@@ -1299,6 +1301,15 @@ class MeharnessApp(App):
         try:
             async for event in self.agent.run(self.conversation):
                 if isinstance(event, ThinkingText):
+                    thinking_accum += event.text
+                    if thinking_widget is None:
+                        from rich.text import Text as RichText
+                        thinking_widget = Static("", classes="message thinking-message")
+                        await ai_row.mount(thinking_widget)
+                    t = RichText()
+                    t.append("⟳ ", style="dim")
+                    t.append(thinking_accum, style="dim italic")
+                    thinking_widget.update(t)
                     self.call_after_refresh(chat.scroll_end, animate=False)
 
                 elif isinstance(event, StreamText):
@@ -1897,16 +1908,20 @@ class MeharnessApp(App):
         self.exit()
 
     def _show_error(self, text: str) -> None:
-        chat = self.query_one("#chat-area", VerticalScroll)
-        error_widget = Static(f"✖ {text}", classes="message error-message")
-        chat.mount(error_widget)
-        self.call_after_refresh(chat.scroll_end, animate=False)
+        self._append_to_chat(f"✖ {text}", "message error-message")
 
     def _show_system_message(self, text: str) -> None:
-        chat = self.query_one("#chat-area", VerticalScroll)
-        msg = Static(f"  {text}", classes="message system-message")
-        chat.mount(msg)
-        self.call_after_refresh(chat.scroll_end, animate=False)
+        self._append_to_chat(f"  {text}", "message system-message")
+
+    def _append_to_chat(self, content: str, classes: str) -> None:
+        """向 #chat-area 追加一条消息；UI 处于异常状态（如取消后/退出中）时静默丢弃，绝不崩溃。"""
+        try:
+            chat = self.query_one("#chat-area", VerticalScroll)
+            widget = Static(content, classes=classes)
+            chat.mount(widget)
+            self.call_after_refresh(chat.scroll_end, animate=False)
+        except Exception:
+            pass
 
     _MODE_DISPLAY = {
         PermissionMode.DEFAULT: "default",
