@@ -1,8 +1,3 @@
-# 来源：公众号@小林coding
-# 后端八股网站：xiaolincoding.com
-# Agent网站：xiaolinnote.com
-# 简历模版：jianli.xiaolinnote.com
-
 """SubAgent 系统的测试（第 12 章）。"""
 
 from __future__ import annotations
@@ -195,7 +190,7 @@ class TestAgentLoader:
         assert "Explore" in agents
         assert "Plan" in agents
         assert "general-purpose" in agents
-        assert agents["Explore"].model == "haiku"
+        assert agents["Explore"].model == "inherit"  # 修复：inherit 而非 haiku（deepseek 端点无 claude-haiku）
         assert agents["Explore"].max_turns == 30
 
     def test_verification_disabled_by_default(self, tmp_path: Path):

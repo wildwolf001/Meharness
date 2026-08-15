@@ -1,7 +1,3 @@
-# 来源：公众号@小林coding
-# 后端八股网站：xiaolincoding.com
-# Agent网站：xiaolinnote.com
-# 简历模版：jianli.xiaolinnote.com
 """跨平台剪贴板写入。优先 Windows 原生 API（不依赖第三方库），
 其余平台退回 xclip。供 `/copy` 命令与 TUI 拖拽选区共用。"""
 

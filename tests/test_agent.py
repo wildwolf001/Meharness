@@ -1,8 +1,3 @@
-# 来源：公众号@小林coding
-# 后端八股网站：xiaolincoding.com
-# Agent网站：xiaolinnote.com
-# 简历模版：jianli.xiaolinnote.com
-
 """Agent Loop 的集成测试 —— 以编程方式逐项验证 checklist。"""
 from __future__ import annotations
 
@@ -574,6 +569,54 @@ async def test_plan_mode_denied_tool_returns_error():
         # plan 模式在写入前会询问；这里模拟用户拒绝。
         if isinstance(e, PermissionRequest):
             e.future.set_result(PermissionResponse.DENY)
+
+    c = _collect(events)
+    assert len(c["tool_result"]) == 1
+    assert c["tool_result"][0].is_error
+    assert "denied" in c["tool_result"][0].output.lower() or "拒绝" in c["tool_result"][0].output
+    assert len(c["error"]) == 0
+
+@pytest.mark.asyncio
+async def test_permission_ask_timeout_auto_denies(monkeypatch):
+    """权限面板长时间无响应（future 永不 resolve）时 agent 应超时自动拒绝，
+    而不是永久卡等（曾表现为"权限弹窗异常后跑着卡住"）。"""
+    import meharness.agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "PERMISSION_PROMPT_TIMEOUT", 0.2)
+    from meharness.permissions import (
+        DangerousCommandDetector,
+        PathSandbox,
+        PermissionChecker,
+        PermissionMode,
+        RuleEngine,
+    )
+
+    client = MockLLMClient([
+        [
+            TextDelta("I'll write..."),
+            ToolCallComplete("t1", "WriteFile", {"file_path": "x.txt", "content": "hi"}),
+            StreamEnd("end_turn", input_tokens=10, output_tokens=20),
+        ],
+        [
+            TextDelta("Timed out, auto-denied."),
+            StreamEnd("end_turn", input_tokens=30, output_tokens=15),
+        ],
+    ])
+    registry = create_default_registry()
+    checker = PermissionChecker(
+        detector=DangerousCommandDetector(),
+        sandbox=PathSandbox("."),
+        rule_engine=RuleEngine(),
+        mode=PermissionMode.DEFAULT,
+    )
+    agent = Agent(client, registry, "anthropic", permission_checker=checker)
+    conv = ConversationManager()
+    conv.add_user_message("Write a file")
+
+    events = []
+    async for e in agent.run(conv):
+        events.append(e)
+        # 模拟 UI 面板挂了：拿到 PermissionRequest 但绝不 resolve future
 
     c = _collect(events)
     assert len(c["tool_result"]) == 1

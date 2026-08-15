@@ -1,7 +1,3 @@
-# 来源：公众号@小林coding
-# 后端八股网站：xiaolincoding.com
-# Agent网站：xiaolinnote.com
-# 简历模版：jianli.xiaolinnote.com
 """ReplApp —— 行流式 TUI 控制器（替代 Textual MeharnessApp）。
 
 用 LineStream 做顺序追加 + 块内流式渲染；自研 raw 按键输入；
@@ -43,7 +39,7 @@ from meharness.commands import CommandRegistry, complete, parse_command
 from meharness.commands.registry import CommandContext
 from meharness.commands.handlers import register_all_commands
 from meharness.config import MCPServerConfig, ProviderConfig, WorktreeConfig
-from meharness.conversation import ConversationManager, Message
+from meharness.conversation import ConversationManager, Message, ToolResultBlock
 from meharness.hooks import HookEngine
 from meharness.memory import (
     MemoryManager,
@@ -91,6 +87,13 @@ from meharness.ui.clipboard import set_clipboard
 from meharness.ui.selection import SelectionState, extract_selected_text
 
 _MAX_INPUT = 4000
+
+# overlay 交互等待超时（秒）：主循环停止喂键/面板异常时兜底返回，避免永久等
+# （配合 agent 侧权限 future 的 PERMISSION_PROMPT_TIMEOUT，双保险）。
+_OVERLAY_TIMEOUT = 120
+# 工具 spinner 单例最长运行时间（秒）：超时强停，防 ToolResultEvent 丢失时
+# 0.1s 全屏重绘风暴（CPU 打满 + 屏幕狂闪）。
+_TOOL_SPINNER_MAX_SECONDS = 180
 
 # 工具执行 spinner 帧（对齐 claude：执行期间动词转帧）
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -228,7 +231,18 @@ class ReplApp:
         self._active_tool_blocks: dict[str, tuple[str, str]] = {}  # tool_id -> (block_id, verb)
         self._tool_spinner_timer: asyncio.Task | None = None
         self._tool_spinner_frame = 0
+        self._tool_spinner_start = 0.0
         self._token_warned = False
+
+        # 回合步号 + working 动词（状态栏实时显示当前在做什么）
+        self._turn_no = 0
+        self._working_verb = ""
+        # LLM 调用期间首字节未到（DeepSeek 大上下文推理 TTFB 数十秒）标志，
+        # 状态栏据此显示 "Thinking…"，避免"看屏幕以为卡死"。
+        self._awaiting_first_byte = False
+        # @文件补全的目录列表缓存：dir -> (时间戳, entries)，避免每次 tab 都
+        # 走可能挂秒级的 os.listdir（网络盘/大目录）。
+        self._dir_cache: dict[str, tuple[float, list[str]]] = {}
 
         # 记忆去重 + 近期工具（对齐 claude sideQuery 的 already_surfaced/recent_tools）
         self._surfaced_memories: set[str] = set()
@@ -272,6 +286,17 @@ class ReplApp:
         if self.memory_manager is not None and self._selected_provider is not None:
             asyncio.create_task(self._session_prefetch())
 
+        # 兜底：Ctrl+C 无论走 SIGINT 还是输入字节，都不应空载退出程序。
+        # （真退出用 /exit 或输入 exit。）keys.py 已清 PROCESSED_INPUT 让 ctrl-c
+        # 以输入字节送达；这里是给个别终端/回退路径的保险。
+        if sys.platform == "win32":
+            try:
+                import signal
+
+                signal.signal(signal.SIGINT, lambda *_: None)
+            except Exception:
+                pass
+
         loop = asyncio.get_running_loop()
         threading.Thread(target=self._key_pump, args=(loop,), daemon=True).start()
 
@@ -285,21 +310,31 @@ class ReplApp:
             await self._shutdown()
 
     def _key_pump(self, loop: asyncio.AbstractEventLoop) -> None:
-        kr = KeyReader()
-        try:
-            while True:
-                k = kr.read_key()
-                try:
-                    loop.call_soon_threadsafe(self._keys.put_nowait, k)
-                except Exception:
-                    break
-        except Exception:
-            pass
-        finally:
+        """后台键盘泵：把按键塞进主循环队列。
+
+        自愈：read_key 抛异常时不再"吞掉后线程静默死亡"（那会导致键盘+鼠标
+        全冻结、只能强杀进程）。改为重建 KeyReader 重启线程；配合 keys.py 里
+        所有读路径的有界超时，单次解析异常不会拖垮整个输入。
+        """
+        while not self._quit:
+            kr = KeyReader()
             try:
-                kr.restore_terminal()
+                while not self._quit:
+                    k = kr.read_key()
+                    try:
+                        loop.call_soon_threadsafe(self._keys.put_nowait, k)
+                    except Exception:
+                        return
             except Exception:
                 pass
+            finally:
+                try:
+                    kr.restore_terminal()
+                except Exception:
+                    pass
+            # 自愈间隔：让出 CPU，避免异常时忙转
+            import time as _t
+            _t.sleep(0.2)
 
     async def _shutdown(self) -> None:
         try:
@@ -469,7 +504,7 @@ class ReplApp:
         from meharness.agents.loader import AgentLoader
         from meharness.agents.task_manager import TaskManager
         from meharness.agents.trace import TraceManager
-        from meharness.teams.manager import TeamManager
+        from meharness.teams.manager import TeamManager, register_main_agent_task_tools
         from meharness.tools.agent_tool import AgentTool
         from meharness.tools.team_create import TeamCreateTool
         from meharness.tools.team_delete import TeamDeleteTool
@@ -495,6 +530,12 @@ class ReplApp:
         self.team_manager = TeamManager(
             worktree_manager=self.worktree_manager,
             trace_manager=self.trace_manager,
+        )
+
+        # 主 agent 的本地任务板：TaskCreate/TaskList/TaskGet/TaskUpdate 注册进
+        # 主 agent 工具集（提示词指示"用 TaskCreate 拆解工作"，此前主 agent 调不到）。
+        register_main_agent_task_tools(
+            self.registry, self.team_manager, agent_name="meharness"
         )
 
         self.registry.register(
@@ -576,7 +617,11 @@ class ReplApp:
         self._agent_task = asyncio.create_task(self._send_message(text))
 
     def _update_status(self, render: bool = True) -> None:
-        """底部状态栏：模式 · token in/out · 会话时长。"""
+        """底部状态栏：模式 · working 动词 · token in/out · 上下文占用% · 时长。
+
+        working 动词让 LLM 调用期（尤其 DeepSeek TTFB 数十秒）有"活着"的
+        反馈；上下文占用% 是长期高效运转的关键水位提示。
+        """
         if self.agent is None:
             self.stream.set_status("", render=render)
             return
@@ -585,7 +630,25 @@ class ReplApp:
         elapsed = int(_time.monotonic() - self._start_time) if getattr(self, "_start_time", None) else 0
         in_k = _fmt_k(self.agent.total_input_tokens)
         out_k = _fmt_k(self.agent.total_output_tokens)
-        self.stream.set_status(f"{label} · in {in_k} · out {out_k} · {elapsed}s", render=render)
+
+        parts: list[str] = [label]
+        if self._streaming:
+            verb = self._working_verb or "Working"
+            if self._awaiting_first_byte:
+                verb = "Thinking…"  # 首字节未到（推理期）
+            parts.append(verb)
+        parts.append(f"in {in_k} · out {out_k}")
+
+        # 上下文占用%（基于真实用量锚点 + 尾部估算）
+        window = self.agent.context_window or 200_000
+        try:
+            used = self.conversation.current_tokens()
+        except Exception:
+            used = 0
+        ctx_pct = int(used / window * 100) if window else 0
+        parts.append(f"ctx {ctx_pct}%")
+        parts.append(f"{elapsed}s")
+        self.stream.set_status(" · ".join(parts), render=render)
 
         # 接近上下文窗口时一次性告警横幅（对齐 claude TokenWarning）
         if not self._token_warned and self.agent.total_input_tokens > int(
@@ -654,6 +717,12 @@ class ReplApp:
         #   未消费的键落到下层 overlay 或输入编辑。
         ov = self.stream.top_overlay()
         if ov is not None:
+            # ctrl-c 对 overlay 是"取消交互"：弹栈栈顶 overlay 并让 result
+            # 返回默认值（权限→拒绝 / AskUser→空 / 输入→空）。否则用户按
+            # ctrl-c 没反应，只能 Esc，观感就是"卡死"。
+            if key == ("ctrl_c",):
+                self._cancel_top_overlay(ov)
+                return
             # 从栈顶向下走：第一个消费按键的 overlay 赢；modal overlay 吞掉
             # 未消费的键；非 modal（banner 等）不消费则让键落到下层。
             o = ov
@@ -731,7 +800,7 @@ class ReplApp:
             self.stream.scroll(self.stream._content_height() // 2)
         elif kind == "ctrl_c":
             if self._selection.active:
-                self._copy_selection()
+                await self._copy_selection()
             else:
                 await self._interrupt()
         elif kind == "left":
@@ -787,12 +856,14 @@ class ReplApp:
             self._selection.update(row, col)
         self.stream.render()
 
-    def _copy_selection(self) -> None:
+    async def _copy_selection(self) -> None:
         text = extract_selected_text(self.stream, self._selection)
         self._selection.clear()
         if text:
             try:
-                set_clipboard(text)
+                # 剪贴板写入移到线程池：Windows ctypes 在个别情况（剪贴板被其它
+                # 进程占用）会阻塞，同步执行会冻结主循环。
+                await asyncio.to_thread(set_clipboard, text)
                 self.stream.append_block(
                     [Seg(f"  ✓ 已复制 {len(text)} 字符", fg=fg256(42))]
                 )
@@ -883,7 +954,11 @@ class ReplApp:
         elif "@" in text:
             prefix = text.rsplit("@", 1)[1]
             work_dir = self.agent.work_dir if self.agent else os.getcwd()
-            matches = self._scan_files_for_at(prefix, work_dir)
+            # 目录扫描移到线程池：os.listdir 在网络盘/大目录上可能挂秒级，
+            # 在主循环里同步执行会冻结整个 UI（鼠标+流式+输入全停）。
+            matches = await asyncio.to_thread(
+                self._scan_files_for_at, prefix, work_dir
+            )
             if matches:
                 self._input_text = text.rsplit("@", 1)[0] + "@" + matches[0] + " "
                 self._input_cursor = len(self._input_text)
@@ -894,21 +969,30 @@ class ReplApp:
         base = os.path.join(work_dir, os.path.dirname(prefix)) if "/" in prefix else work_dir
         name_prefix = os.path.basename(prefix).lower()
         out: list[str] = []
-        if not os.path.isdir(base):
-            return out
-        try:
-            for entry in sorted(os.listdir(base)):
-                if entry in _SKIP or entry.startswith("."):
-                    continue
-                if entry.lower().startswith(name_prefix):
-                    rel = os.path.join(os.path.dirname(prefix), entry) if "/" in prefix else entry
-                    if os.path.isdir(os.path.join(base, entry)):
-                        rel += "/"
-                    out.append(rel)
-                    if len(out) >= 10:
-                        break
-        except OSError:
-            pass
+        # 目录列表缓存（TTL 2s）：@补全在流式输入时每次按键都会触发，重复
+        # os.listdir 在大目录/网络盘上会拖慢主循环。
+        now = _time.monotonic()
+        cached = self._dir_cache.get(base)
+        if cached is not None and now - cached[0] < 2.0:
+            entries = cached[1]
+        else:
+            if not os.path.isdir(base):
+                return out
+            try:
+                entries = sorted(os.listdir(base))
+            except OSError:
+                return out
+            self._dir_cache[base] = (now, entries)
+        for entry in entries:
+            if entry in _SKIP or entry.startswith("."):
+                continue
+            if entry.lower().startswith(name_prefix):
+                rel = os.path.join(os.path.dirname(prefix), entry) if "/" in prefix else entry
+                if os.path.isdir(os.path.join(base, entry)):
+                    rel += "/"
+                out.append(rel)
+                if len(out) >= 10:
+                    break
         return out
 
     async def _cycle_mode(self) -> None:
@@ -947,6 +1031,10 @@ class ReplApp:
         if self._streaming and self._agent_task and not self._agent_task.done():
             self._agent_task.cancel()
             self.stream.commit_text("  (response interrupted)")
+        elif not self._streaming:
+            # 空载：Ctrl+C 不退出程序（/exit 或输入 exit 才退出），给个提示，
+            # 避免用户以为按了没反应又连按。
+            self.add_system_message("（空载 Ctrl+C 不退出；/exit 或输入 exit 退出）")
 
     async def _submit(self) -> None:
         text = self._input_text.strip()
@@ -1072,6 +1160,11 @@ class ReplApp:
         self._thinking_shown = False
         self._thinking_block: str | None = None  # 实时流式显示 thinking 的块
         self._thinking_collapsed = False
+        # 首字节等待标志 + working 动词：LLM 调用期状态栏显示 "Thinking…"
+        # （DeepSeek 大上下文 TTFB 数十秒，没有这个用户以为卡死）。
+        self._awaiting_first_byte = True
+        self._working_verb = "Thinking…"
+        self._turn_no = 0
         history_cursor = len(self.conversation.history)
         accumulated = ""
         width = self._term_width()
@@ -1087,9 +1180,16 @@ class ReplApp:
                 if isinstance(event, StreamText):
                     accumulated += event.text
                     self._turn_text += event.text
+                    self._awaiting_first_byte = False
+                    self._working_verb = ""
                     if self._stream_block is None:
+                        # 首字节才建块，带回合步号（对齐 claude 的 Step n）
+                        self._turn_no += 1
                         self._stream_block = self.stream.append_block(
-                            [Seg("● ", fg=fg256(173))]
+                            [
+                                Seg("● ", fg=fg256(173)),
+                                Seg(f"{self._turn_no} ", fg=fg256(246)),
+                            ]
                         )
                     # 增量续写（O(delta)）；之前 update_block 每 token 整段重折行 O(n²)
                     self.stream.update_block_append(
@@ -1122,10 +1222,21 @@ class ReplApp:
                     )
                 except Exception:
                     pass
+            # 中断时补齐悬空的 tool_use→tool_result 配对（对齐 claude-code
+            # yieldMissingToolResultBlocks）：否则 resume 后对话含"assistant 发了
+            # tool_use 却没 tool_result"的非法序列，状态不一致。
+            try:
+                self.conversation.synthesize_interrupted_tool_results()
+            except Exception:
+                pass
         except Exception as e:
             self.stream.commit_text(f"  ✖ {e}")
         finally:
             self._streaming = False
+            self._awaiting_first_byte = False
+            self._working_verb = ""
+            # 兜底停工具 spinner：防 ToolResultEvent 丢失时无限重绘风暴
+            self._stop_tool_spinner()
             ticker_task.cancel()
             self._render_input()
             # 预取本轮没用上且还没跑完：取消，避免后台任务泄漏（对齐 claude-code
@@ -1221,6 +1332,8 @@ class ReplApp:
         if isinstance(event, ThinkingText):
             self._thinking_accum += event.text
             self._thinking_shown = True
+            self._awaiting_first_byte = False
+            self._working_verb = "Thinking…"
             if self._thinking_collapsed:
                 return
             # 实时流式显示思考内容（暗色斜体）——否则长推理期屏幕静止，
@@ -1236,6 +1349,8 @@ class ReplApp:
             self.stream.commit_text(f"  ↻ Retrying: {event.reason}")
         elif isinstance(event, ToolUseEvent):
             verb = tool_verb(event.tool_name, event.arguments)
+            self._awaiting_first_byte = False
+            self._working_verb = verb
             block_id = self.stream.append_block(
                 [Seg("  ⏳ ", fg=fg256(246)), Seg(f"[{verb}]", fg=fg256(173))]
             )
@@ -1259,6 +1374,9 @@ class ReplApp:
                     Seg(f" ({event.elapsed:.1f}s)", fg=fg256(246)),
                 ]
             )
+            # 工具结束后通常回到 LLM 推理期：恢复 Thinking 进度提示
+            self._working_verb = "Thinking…"
+            self._awaiting_first_byte = True
             if not self._active_tool_blocks and self._tool_spinner_timer is not None:
                 self._tool_spinner_timer.cancel()
                 self._tool_spinner_timer = None
@@ -1266,6 +1384,9 @@ class ReplApp:
             # 回合结束：把该回合的流式纯文本重排成带样式的 markdown 块
             # （标题加粗/代码块底色/行内代码变色，对齐 claude 观感），再终结。
             self._finalize_stream_block()
+            # 关键：重置回合文本累加。否则下一回合的 StreamText 会累积到旧文本上，
+            # finalize 时把"旧+新"整段重排进新块 → 每步回复开头重复上一段。
+            self._turn_text = ""
             # 下一回合文本开新块（对齐 claude 每步一段）
             self._stream_block = None
             if self.session:
@@ -1277,6 +1398,8 @@ class ReplApp:
             self._finalize_stream_block()
             self._turn_text = ""
             self._stream_block = None
+            self._working_verb = ""
+            self._stop_tool_spinner()
             total_time = _time.monotonic() - self._thinking_start
             if self.agent:
                 done = (
@@ -1300,6 +1423,8 @@ class ReplApp:
         elif isinstance(event, ErrorEvent):
             self.stream.commit_text(f"  ✖ {event.message}")
             self._push_banner(event.message, FG_RED)
+            self._working_verb = ""
+            self._stop_tool_spinner()
         elif isinstance(event, HookEvent):
             status = "✓" if event.success else "✗"
             self.stream.commit_text(f"  Hook [{event.hook_id}] {status} {event.output}")
@@ -1323,6 +1448,19 @@ class ReplApp:
         if self.stream.top_overlay() is ov:
             self.stream.pop_overlay()
 
+    def _cancel_top_overlay(self, ov) -> None:
+        """ctrl-c 取消：让栈顶 overlay 的 result 返回默认值（None）并弹栈。
+
+        各调用方把 None 当作"取消"处理：权限→拒绝、AskUser→空答案、
+        自由输入→空串、plan→反馈分支。用 shield 保护 future 不被取消，
+        让等待方（_run_overlay / agent 侧 wait_for）正常拿到值而非 CancelledError。
+        """
+        result = getattr(ov, "result", None)
+        if result is not None and not result.done():
+            result.set_result(None)
+        self.stream.remove_overlay(ov)
+        self.stream.render()
+
     async def _run_overlay(self, ov: Overlay) -> Any:
         """挂载 overlay 并等待用户选择，返回 overlay 的 result。
 
@@ -1332,10 +1470,20 @@ class ReplApp:
         先拿到键，overlay 永远等不到输入，事件 future 永不 resolve，agent 干等
         超时（曾表现为"卡在 AskUserEvent / 权限面板 / Bash 命令"）。
         所以只 await ov.result：主循环喂键 → on_key resolve → 主循环 pop。
+
+        带 _OVERLAY_TIMEOUT 兜底：主循环停止喂键（如后台 _send_message 被
+        其它任务阻塞）时，等待方不会被永久挂住，超时返回 None。
         """
         self._open_overlay(ov)
         try:
-            return await ov.result
+            return await asyncio.wait_for(
+                asyncio.shield(ov.result), timeout=_OVERLAY_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            # 兜底超时：把 future 置为已完成，避免后续 set_result 报错。
+            if not ov.result.done():
+                ov.result.set_result(None)
+            return None
         finally:
             self._close_overlay(ov)
 
@@ -1373,14 +1521,32 @@ class ReplApp:
         self._render_input()
         await self._dispatch(f"/{cmd.name}" + (f" {rest}" if rest else ""))
 
+    def _stop_tool_spinner(self) -> None:
+        """强停工具 spinner 并清空活跃工具表。
+
+        ToolResultEvent 丢失/错配（agent 报错/中断/回合异常结束）时，如果放任
+        _active_tool_blocks 里的条目不清理，spinner 会永远转下去 → 0.1s 一次全屏
+        重绘 → CPU 打满 + 屏幕狂闪。任何"回合终结"路径都必须调它。
+        """
+        self._active_tool_blocks.clear()
+        if self._tool_spinner_timer is not None:
+            self._tool_spinner_timer.cancel()
+            self._tool_spinner_timer = None
+
     def _ensure_tool_spinner(self) -> None:
         """工具执行时启动单例转帧定时器；全部结束后停止。"""
         if self._tool_spinner_timer is not None and not self._tool_spinner_timer.done():
             return
         frames = _SPINNER_FRAMES
+        # 看门狗：spinner 单例最多跑 _TOOL_SPINNER_MAX_SECONDS，超时强制退出，
+        # 防"工具真在跑但事件丢失"导致无限重绘。
+        started = _time.monotonic()
+        self._tool_spinner_start = started
 
         async def _spin() -> None:
             while self._active_tool_blocks:
+                if _time.monotonic() - started > _TOOL_SPINNER_MAX_SECONDS:
+                    break
                 frame = frames[self._tool_spinner_frame % len(frames)]
                 self._tool_spinner_frame += 1
                 for _tool_id, (block_id, verb) in list(self._active_tool_blocks.items()):
@@ -1392,6 +1558,7 @@ class ReplApp:
                         ],
                     )
                 await asyncio.sleep(0.1)
+            self._tool_spinner_timer = None
 
         self._tool_spinner_timer = asyncio.create_task(_spin())
 

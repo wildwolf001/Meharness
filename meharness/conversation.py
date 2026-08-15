@@ -1,7 +1,3 @@
-# 来源：公众号@小林coding
-# 后端八股网站：xiaolincoding.com
-# Agent网站：xiaolinnote.com
-# 简历模版：jianli.xiaolinnote.com
 from __future__ import annotations
 
 import json
@@ -159,6 +155,45 @@ class ConversationManager:
         self.history.append(
             Message(role="user", content="", tool_results=tool_results)
         )
+
+    def synthesize_interrupted_tool_results(self) -> None:
+        """中断时补齐 conversation 中悬空的 tool_use → tool_result 配对。
+
+        对齐 claude-code 的 yieldMissingToolResultBlocks / StreamingToolExecutor
+        getRemainingResults：用户打断正在执行工具的回合时，已经 y 出的 assistant
+        tool_use 必须有一条 user tool_result 承接，否则 resume 后 API 会收到
+        "assistant 发了 tool_use 却没有 tool_result" 的非法序列，模型也看不到
+        被中断的工具状态。
+
+        从尾部找最近一条带 tool_uses 的 assistant 消息，为其中尚未被任何
+        tool_results 消息承接的调用合成 is_error 结果。无悬空则不做任何事。
+        """
+        for i in range(len(self.history) - 1, -1, -1):
+            msg = self.history[i]
+            if msg.role != "assistant" or not msg.tool_uses:
+                continue
+            done_ids = {
+                tr.tool_use_id
+                for m in self.history[i + 1:]
+                for tr in m.tool_results
+            }
+            pending = [
+                tu.tool_use_id
+                for tu in msg.tool_uses
+                if tu.tool_use_id not in done_ids
+            ]
+            if pending:
+                self.add_tool_results_message(
+                    [
+                        ToolResultBlock(
+                            tool_use_id=tid,
+                            content="Tool execution interrupted by user.",
+                            is_error=True,
+                        )
+                        for tid in pending
+                    ]
+                )
+            return
 
 
     def inject_environment(self, context: str) -> None:

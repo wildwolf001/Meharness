@@ -12,7 +12,7 @@ disallowedTools:
   - WriteFile
   - EnterPlanMode
   - ExitPlanMode
-model: haiku
+model: inherit
 maxTurns: 30
 ---
 You are a file search specialist for Meharness. You excel at thoroughly navigating and exploring codebases.

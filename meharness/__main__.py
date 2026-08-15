@@ -1,8 +1,3 @@
-# 来源：公众号@小林coding
-# 后端八股网站：xiaolincoding.com
-# Agent网站：xiaolinnote.com
-# 简历模版：jianli.xiaolinnote.com
-
 from __future__ import annotations
 
 import argparse
@@ -123,7 +118,7 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str) -> None
     from meharness.agents.trace import TraceManager
     from meharness.tools.agent_tool import AgentTool
     from meharness.tools.impl.tool_search import ToolSearchTool
-    from meharness.teams.manager import TeamManager
+    from meharness.teams.manager import TeamManager, register_main_agent_task_tools
     from meharness.teams.models import BackendType
     from meharness.tools.team_create import TeamCreateTool
     from meharness.tools.team_delete import TeamDeleteTool
@@ -174,6 +169,7 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str) -> None
     agent_loader = AgentLoader(work_dir, enable_verification=config.enable_verification_agent)
     agent_loader.load_all()
     team_manager = TeamManager(worktree_manager=wt_manager, trace_manager=trace_manager)
+    register_main_agent_task_tools(registry, team_manager, agent_name="meharness")
 
     agent_tool = AgentTool(
         agent_loader=agent_loader,

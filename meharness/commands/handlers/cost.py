@@ -1,8 +1,3 @@
-# 来源：公众号@小林coding
-# 后端八股网站：xiaolincoding.com
-# Agent网站：xiaolinnote.com
-# 简历模版：jianli.xiaolinnote.com
-
 from __future__ import annotations
 
 from meharness.commands.registry import Command, CommandContext, CommandType
@@ -35,12 +30,26 @@ async def handle_cost(ctx: CommandContext) -> None:
     cost_in = input_tokens / 1_000_000 * price_in
     cost_out = output_tokens / 1_000_000 * price_out
 
+    # 上下文水位：长期高效运转的关键提示（真实用量锚点 + 尾部估算）
+    window = getattr(ctx.agent, "context_window", 0) or 0
+    used = 0
+    try:
+        used = ctx.conversation.current_tokens()
+    except Exception:
+        pass
+    ctx_pct = int(used / window * 100) if window else 0
+    ctx_line = (
+        f"上下文: {used:,} / {window:,} tokens（{ctx_pct}%）"
+        if window else "上下文: 未知窗口"
+    )
+
     lines = [
         "Token 用量与成本估算",
         "────────────────────",
         f"模型: {model or 'unknown'}",
         f"输入: {input_tokens:,} tokens",
         f"输出: {output_tokens:,} tokens",
+        ctx_line,
         (
             f"估算成本: {cost_in + cost_out:.6f} "
             f"（输入 {cost_in:.6f} + 输出 {cost_out:.6f}）"

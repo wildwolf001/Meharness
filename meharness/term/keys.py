@@ -1,7 +1,3 @@
-# 来源：公众号@小林coding
-# 后端八股网站：xiaolincoding.com
-# Agent网站：xiaolinnote.com
-# 简历模版：jianli.xiaolinnote.com
 """raw 按键读取：归一化成简单键值。
 
 兼容：
@@ -163,10 +159,14 @@ class KeyReader:
             return False
 
     def _enable_windows_vt(self) -> bool:
-        """启用控制台 VT 输入模式 + 去行缓冲/回显。
+        """启用控制台 VT 输入模式 + 去行缓冲/回显 + 去 Ctrl+C 信号化。
 
         对齐 claude-code：直接读 stdin 原始字节，键盘+鼠标 SGR 一起收。
         保存旧模式供 restore。失败返回 False（调用方退回 msvcrt）。
+
+        关键：同时清除 ENABLE_PROCESSED_INPUT(0x0001)——否则 Ctrl+C 会生成
+        SIGINT/CTRL_C_EVENT 直接中断 Python（空载时表现为按一次 ctrl+c 整个程序
+        退出），而不是作为输入字节 ``("ctrl_c",)`` 送达交给主循环处理。
         """
         try:
             import ctypes
@@ -176,13 +176,20 @@ class KeyReader:
             mode = ctypes.c_uint()
             if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
                 return False
+            old = mode.value
             ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
-            new_mode = (mode.value | ENABLE_VIRTUAL_TERMINAL_INPUT) & ~0x0006
-            # ~0x0006: 去掉 ENABLE_LINE_INPUT(2) + ENABLE_ECHO_INPUT(4)
+            # ~0x0007 = 去掉 PROCESSED_INPUT(1) + LINE_INPUT(2) + ECHO_INPUT(4)
+            new_mode = (old | ENABLE_VIRTUAL_TERMINAL_INPUT) & ~0x0007
             if not kernel32.SetConsoleMode(handle, new_mode):
+                # VT 不可用：仍尽量清 PROCESSED_INPUT，让 ctrl-c 以输入字节送达
+                # （否则 msvcrt 回退路径下空载 ctrl-c 仍会 SIGINT 退程序）。
+                try:
+                    kernel32.SetConsoleMode(handle, old & ~0x0007)
+                except Exception:
+                    pass
                 return False
             self._vt_enabled = True
-            self._old_console_mode = mode.value
+            self._old_console_mode = old
             return True
         except Exception:
             return False
@@ -416,7 +423,10 @@ class KeyReader:
             return ("unknown",)
         seq = bytearray([b])
         for _ in range(need):
-            nb = self._read_byte(wait=True)
+            # 续字节用有界读取（复用 _read_vt_byte 的轮询/队列超时），绝不能
+            # 无限阻塞等续字节——半截 UTF-8（如 ConPTY 分片粘贴）会让 key pump
+            # 永久挂死，整个输入（键盘+鼠标）冻结。等不到就放弃当前字符。
+            nb = self._read_vt_byte()
             if nb == -1:
                 break
             seq.append(nb)

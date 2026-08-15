@@ -1,8 +1,3 @@
-# 来源：公众号@小林coding
-# 后端八股网站：xiaolincoding.com
-# Agent网站：xiaolinnote.com
-# 简历模版：jianli.xiaolinnote.com
-
 from __future__ import annotations
 
 import json
@@ -665,6 +660,31 @@ class TestMemoryManager:
         assert "uses PostgreSQL" in project_content
         assert "docs at example.com" in project_content
         assert "use spaces" not in project_content
+
+    def test_write_memories_writes_structured_retrieval_files(self, tmp_path, monkeypatch) -> None:
+        """自动提取的记忆除了 flat memories.md，还要写成带 frontmatter 的结构化
+        文件放进检索目录——否则 sideQuery 的 per-query 选择永远为空。"""
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+        mgr = MemoryManager(str(tmp_path / "project"))
+        mgr._write_memories(
+            "### 用户偏好\n- use spaces\n\n"
+            "### 项目知识\n- uses PostgreSQL\n"
+        )
+
+        user_retrieval = fake_home / ".meharness" / "memory" / "auto-preferences.md"
+        assert user_retrieval.exists()
+        content = user_retrieval.read_text(encoding="utf-8")
+        assert "type: user" in content
+        assert "use spaces" in content
+
+        project_retrieval = tmp_path / "project" / ".meharness" / "memory" / "auto-project-knowledge.md"
+        assert project_retrieval.exists()
+        pcontent = project_retrieval.read_text(encoding="utf-8")
+        assert "type: project" in pcontent
+        assert "PostgreSQL" in pcontent
 
 # =========================================================================
 # H. 会话注入长期记忆 inject_long_term_memory

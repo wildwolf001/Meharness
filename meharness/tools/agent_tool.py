@@ -1,7 +1,3 @@
-# 来源：公众号@小林coding
-# 后端八股网站：xiaolincoding.com
-# Agent网站：xiaolinnote.com
-# 简历模版：jianli.xiaolinnote.com
 from __future__ import annotations
 
 import logging
@@ -751,6 +747,16 @@ class AgentTool(Tool):
             "opus": "claude-opus-4-6-20250514",
         }
         model_id = model_map.get(model_alias, model_alias)
+
+        # 别名映射到 Claude 模型：只在 anthropic 协议下有意义。在非 anthropic
+        # 端点（如 deepseek openai-compat）下，这些模型 ID 不存在，构造出的
+        # 客户端会让子 agent 一调 LLM 就秒挂（曾表现为 Explore 子代理 0.2s ✗）。
+        # 返回 None → _select_llm 回退到父模型（inherit）。
+        if (
+            model_id in model_map.values()
+            and self._provider_config.protocol != "anthropic"
+        ):
+            return None
 
         config = ProviderConfig(
             name=f"sub-{model_alias}",

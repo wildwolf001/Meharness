@@ -1,7 +1,3 @@
-# 来源：公众号@小林coding
-# 后端八股网站：xiaolincoding.com
-# Agent网站：xiaolinnote.com
-# 简历模版：jianli.xiaolinnote.com
 """ANSI 转义与轻量 markdown 渲染。够用即可，不追求完整 markdown。"""
 
 from __future__ import annotations

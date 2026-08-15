@@ -1,7 +1,3 @@
-# 来源：公众号@小林coding
-# 后端八股网站：xiaolincoding.com
-# Agent网站：xiaolinnote.com
-# 简历模版：jianli.xiaolinnote.com
 from __future__ import annotations
 
 from pathlib import Path
@@ -151,28 +147,58 @@ class MemoryManager:
 
         self._write_memories(collected)
 
+    # 分类 → (检索目录下的文件名 slug, memory type)
+    # 自动提取的记忆不只写进 flat memories.md（每会话整体注入），还会写成带
+    # frontmatter 的结构化文件放进检索目录 —— 否则 sideQuery 的 per-query 记忆
+    # 选择永远为空（只扫 memory/*.md），自动沉淀的知识没法被精准召回。
+    _STRUCTURED_SLUGS = [
+        ("用户偏好", "auto-preferences", "user"),
+        ("纠正反馈", "auto-feedback", "feedback"),
+        ("项目知识", "auto-project-knowledge", "project"),
+        ("参考资料", "auto-references", "reference"),
+    ]
+
     def _write_memories(self, content: str) -> None:
         user_sections: list[str] = []
         project_sections: list[str] = []
+        structured: dict[str, tuple[str, str]] = {}  # slug -> (type, section_text)
 
         current_header = ""
         current_lines: list[str] = []
 
+        def flush() -> None:
+            nonlocal current_header, current_lines
+            if not current_header:
+                return
+            real_lines = [
+                l for l in current_lines
+                if l.strip().startswith("- ") and not self._is_placeholder(l)
+            ]
+            if real_lines:
+                section_text = current_header + "\n" + "\n".join(real_lines)
+                for keyword, slug, mtype in self._STRUCTURED_SLUGS:
+                    if keyword in current_header:
+                        structured.setdefault(slug, (mtype, section_text))
+                        break
+                for keyword in _USER_LEVEL_HEADERS:
+                    if keyword in current_header:
+                        user_sections.append(section_text)
+                        break
+                for keyword in _PROJECT_LEVEL_HEADERS:
+                    if keyword in current_header:
+                        project_sections.append(section_text)
+                        break
+            current_header = ""
+            current_lines = []
+
         for line in content.split("\n"):
             if line.startswith("### "):
-                if current_header:
-                    self._assign_section(
-                        current_header, current_lines, user_sections, project_sections
-                    )
+                flush()
                 current_header = line
                 current_lines = []
             else:
                 current_lines.append(line)
-
-        if current_header:
-            self._assign_section(
-                current_header, current_lines, user_sections, project_sections
-            )
+        flush()
 
         if user_sections:
             self._user_path.parent.mkdir(parents=True, exist_ok=True)
@@ -186,34 +212,28 @@ class MemoryManager:
                 "\n".join(project_sections).strip() + "\n", encoding="utf-8"
             )
 
+        # 按分类覆盖写结构化 frontmatter 文件（flat 已是合并全集，覆盖即去重）
+        for slug, (mtype, section_text) in structured.items():
+            mem_dir = (
+                self.user_mem_dir if mtype in ("user", "feedback")
+                else self.project_mem_dir
+            )
+            mem_dir.mkdir(parents=True, exist_ok=True)
+            title = section_text.split("\n", 1)[0].lstrip("# ").strip()
+            frontmatter = (
+                f"---\n"
+                f"name: 自动提取-{title}\n"
+                f"description: 从对话中自动提取的{title}（由记忆提取助手维护，每次覆盖更新）\n"
+                f"type: {mtype}\n"
+                f"---\n\n"
+                f"{section_text}\n"
+            )
+            (mem_dir / f"{slug}.md").write_text(frontmatter, encoding="utf-8")
+
     @staticmethod
     def _is_placeholder(line: str) -> bool:
         stripped = line.strip().lstrip("- ").strip()
         return stripped in {"", "...", "…", "无", "暂无", "N/A"}
-
-
-    @staticmethod
-    def _assign_section(
-        header: str,
-        lines: list[str],
-        user_sections: list[str],
-        project_sections: list[str],
-    ) -> None:
-        real_lines = [l for l in lines if l.strip().startswith("- ") and not MemoryManager._is_placeholder(l)]
-        if not real_lines:
-            return
-
-        section_text = header + "\n" + "\n".join(real_lines)
-
-        for keyword in _USER_LEVEL_HEADERS:
-            if keyword in header:
-                user_sections.append(section_text)
-                return
-
-        for keyword in _PROJECT_LEVEL_HEADERS:
-            if keyword in header:
-                project_sections.append(section_text)
-                return
 
 
     def clear(self) -> None:

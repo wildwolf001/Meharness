@@ -1,7 +1,3 @@
-# 来源：公众号@小林coding
-# 后端八股网站：xiaolincoding.com
-# Agent网站：xiaolinnote.com
-# 简历模版：jianli.xiaolinnote.com
 from __future__ import annotations
 
 import json
@@ -16,6 +12,7 @@ from typing import Any, Mapping
 from meharness.conversation import (
     ConversationManager,
     Message,
+    ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
     estimate_tokens,
@@ -34,6 +31,11 @@ KEEP_RECENT_TURNS = 10
 OLD_RESULT_SNIP_CHARS = 2_000
 SNIPPED_TAG = "<snipped>"
 
+# 旧回合 assistant 正文精简（对齐 claude microcompact）：DeepSeek 单回合输出
+# 8k~64k，旧回合的模型回复一字不差全量重发是上下文膨胀主凶——tool_result 有预算、
+# assistant 文本没有。超过该长度时保留头部 + 标记，模型无需逐字读自己的旧回复。
+OLD_ASSISTANT_SNIP_CHARS = 3_000
+
 SUMMARY_OUTPUT_RESERVE = 20_000
 AUTO_COMPACT_SAFETY_MARGIN = 13_000
 MANUAL_COMPACT_SAFETY_MARGIN = 3_000
@@ -45,6 +47,13 @@ MANUAL_COMPACT_SAFETY_MARGIN = 3_000
 KEEP_RECENT_TOKENS = 10_000
 MIN_KEEP_MESSAGES = 5
 KEEP_MAX_TOKENS = 40_000
+
+# thinking 块裁剪（全局，不限回合数）：DeepSeek 推理模型单回合 reasoning 可达
+# 2 万 token，是上下文膨胀的主凶——tool_result 有预算，thinking 却没有。任一
+# 块超 MAX_THINKING_BLOCK_CHARS 折叠为头部摘要；每条消息最多保留
+# MAX_THINKING_BLOCKS 个完整块，其余丢弃。保住推理精华，砍掉重复/啰嗦尾巴。
+MAX_THINKING_BLOCK_CHARS = 6_000
+MAX_THINKING_BLOCKS = 3
 
 # 前缀 token 数低于此阈值时不值得做摘要——摘要往返的开销比回收的空间还大，
 # 退化为不压缩、保留原始历史（避免「压了个寂寞」）。
@@ -237,10 +246,11 @@ def _copy_message(
     msg: Message,
     new_uses: list[ToolUseBlock],
     new_results: list[ToolResultBlock],
+    new_content: str | None = None,
 ) -> Message:
     return Message(
         role=msg.role,
-        content=msg.content,
+        content=msg.content if new_content is None else new_content,
         tool_uses=new_uses,
         tool_results=new_results,
         thinking_blocks=list(msg.thinking_blocks),
@@ -275,9 +285,65 @@ def _truncate_tool_uses(
     return out, changed
 
 
+def _collapse_thinking_blocks(
+    blocks: list[ThinkingBlock],
+) -> tuple[list[ThinkingBlock], bool]:
+    """折叠超大/超量的 thinking 块，返回 (新列表, 是否变化)。
+
+    - 每个块超过 MAX_THINKING_BLOCK_CHARS 时，只保留头部并加折叠标记；
+    - 同一消息最多保留 MAX_THINKING_BLOCKS 个块，其余丢弃。
+    保留原始顺序，signature 不动（Anthropic 续写需要它）。
+    """
+    if not blocks:
+        return blocks, False
+    changed = False
+    out: list[ThinkingBlock] = []
+    for i, tb in enumerate(blocks):
+        if i >= MAX_THINKING_BLOCKS:
+            changed = True
+            continue
+        if len(tb.thinking) > MAX_THINKING_BLOCK_CHARS:
+            out.append(ThinkingBlock(
+                thinking=tb.thinking[:MAX_THINKING_BLOCK_CHARS]
+                + "\n… (thinking collapsed)",
+                signature=tb.signature,
+            ))
+            changed = True
+        else:
+            out.append(tb)
+    return out, changed
+
+
+def _copy_message_with_thinking(
+    msg: Message, new_thinking: list[ThinkingBlock]
+) -> Message:
+    return Message(
+        role=msg.role,
+        content=msg.content,
+        tool_uses=list(msg.tool_uses),
+        tool_results=list(msg.tool_results),
+        thinking_blocks=new_thinking,
+    )
+
+
 def _snip_stale_messages(
     history: list[Message],
 ) -> list[Message]:
+    # Pass 0：全局 thinking 裁剪（不限回合数——DeepSeek 单回合 reasoning 可达
+    # 2 万 token，短会话也能撑爆上下文）。折叠超大块、丢弃多余块后，再走下面
+    # 的"旧回合裁剪"逻辑。
+    collapsed_any = False
+    collapsed: list[Message] = []
+    for m in history:
+        new_thinking, changed = _collapse_thinking_blocks(m.thinking_blocks)
+        if changed:
+            collapsed_any = True
+            collapsed.append(_copy_message_with_thinking(m, new_thinking))
+        else:
+            collapsed.append(m)
+    if collapsed_any:
+        history = collapsed
+
     total_turns = _count_turns(history)
     if total_turns <= KEEP_RECENT_TURNS:
         return history
@@ -293,7 +359,9 @@ def _snip_stale_messages(
             out.append(msg)  # 近回合：原样保留
             continue
 
-        # 旧回合：裁剪 tool 结果 + 截断 tool 调用参数（WriteFile 大内容）
+        # 旧回合：裁剪 assistant 正文 + tool 结果 + 截断 tool 调用参数
+        # （WriteFile 大内容）。assistant 文本精简是对齐 claude microcompact——
+        # 模型无需逐字重读自己旧回合的冗长回复，保留头部即可。
         new_results: list[ToolResultBlock] = []
         results_changed = False
         for tr in msg.tool_results:
@@ -320,8 +388,22 @@ def _snip_stale_messages(
             results_changed = True
 
         new_uses, uses_changed = _truncate_tool_uses(msg.tool_uses)
-        if results_changed or uses_changed:
-            out.append(_copy_message(msg, new_uses, new_results))
+
+        new_text = msg.content
+        text_changed = False
+        if (
+            msg.role == "assistant"
+            and msg.content
+            and len(msg.content) > OLD_ASSISTANT_SNIP_CHARS
+        ):
+            new_text = (
+                msg.content[:OLD_ASSISTANT_SNIP_CHARS]
+                + "\n… (旧回复已精简，如需原文可 ReadFile 会话记录)"
+            )
+            text_changed = True
+
+        if results_changed or uses_changed or text_changed:
+            out.append(_copy_message(msg, new_uses, new_results, new_text))
         else:
             out.append(msg)
 

@@ -1,7 +1,3 @@
-# 来源：公众号@小林coding
-# 后端八股网站：xiaolincoding.com
-# Agent网站：xiaolinnote.com
-# 简历模版：jianli.xiaolinnote.com
 """TUI overlay 层纯函数与交互测试（不依赖真实终端）。"""
 
 from __future__ import annotations
@@ -344,6 +340,25 @@ class TestScreenOverlay:
         assert s.pop_overlay() is ov
         assert s.top_overlay() is None
 
+    def test_interactive_overlay_anchors_bottom(self) -> None:
+        """交互面板（命令补全/AskUser/权限）贴内容区底部、紧靠输入框上方，
+        不再悬浮居中（回归：/compact 面板出现在屏幕中间的问题）。"""
+        for ov in (
+            ListOverlay("Commands", ["a", "b"]),
+            AskUserOverlay("q", ["x", "y"], multi=False),
+            PermissionOverlay("Bash", "ls", {}),
+            TextInputOverlay(),
+        ):
+            ls = ov.lines(40)
+            content_h = 10
+            assert ov.anchor_top(content_h, 40) == max(1, content_h - len(ls) + 1)
+            # 明确不是居中
+            assert ov.anchor_top(content_h, 40) != max(1, (content_h - len(ls)) // 2 + 1)
+
+    def test_banner_overlay_anchors_top(self) -> None:
+        ov = BannerOverlay("warn")
+        assert ov.anchor_top(10, 40) == 1
+
     def test_render_applies_overlay_rows(self) -> None:
         s = self._screen()
         s.append_block([Seg("content line", fg="")])
@@ -352,3 +367,67 @@ class TestScreenOverlay:
         assert "⚠ BANNER" in self._plain(s)
         s.pop_overlay()
         assert "content line" in self._plain(s)
+
+
+# ---------------------------------------------------------------------------
+# overlay ctrl-c 取消（P0-3：modal overlay 不再吞 ctrl-c 导致"卡死"）
+# ---------------------------------------------------------------------------
+
+class TestOverlayCtrlCCancel:
+    @pytest.mark.asyncio
+    async def test_replapp_cancel_top_overlay_on_ctrl_c(self) -> None:
+        """ReplApp 对 ctrl-c 的取消处理：弹栈栈顶 overlay 并把 result 置为
+        默认值（None），权限/AskUser/输入等调用方据此按"取消"处理。"""
+        from meharness.repl.app import ReplApp
+
+        app = ReplApp(providers=[])
+        ov = ListOverlay("t", ["a", "b"])
+        ov.result = asyncio.get_running_loop().create_future()
+        app.stream.push_overlay(ov)
+
+        # 模拟 ReplApp._handle_key 的 ctrl-c 分支
+        app._cancel_top_overlay(ov)
+
+        assert ov.result.done()
+        assert ov.result.result() is None
+        assert app.stream.top_overlay() is None
+
+    @pytest.mark.asyncio
+    async def test_run_overlay_times_out_gracefully(self) -> None:
+        """_run_overlay 在主循环停止喂键时不能永久挂（加 _OVERLAY_TIMEOUT 兜底）。"""
+        import meharness.repl.app as app_mod
+        from meharness.repl.app import ReplApp
+
+        original = app_mod._OVERLAY_TIMEOUT
+        app_mod._OVERLAY_TIMEOUT = 0.05
+        try:
+            app = ReplApp(providers=[])
+            ov = ListOverlay("t", ["a"])
+            val = await app._run_overlay(ov)
+            assert val is None
+            assert app.stream.top_overlay() is None
+        finally:
+            app_mod._OVERLAY_TIMEOUT = original
+
+
+# ---------------------------------------------------------------------------
+# 回复跨回合累加重复（TurnComplete 必须重置 _turn_text）
+# ---------------------------------------------------------------------------
+
+class TestTurnTextReset:
+    @pytest.mark.asyncio
+    async def test_turn_complete_resets_turn_text(self) -> None:
+        """回归：TurnComplete 后 _turn_text 必须清空，否则下一回合的 StreamText
+        会累积到旧文本上，markdown 重排时把"旧+新"整段渲染进新块 → 每步回复
+        开头重复上一段。"""
+        from meharness.agent import TurnComplete
+        from meharness.repl.app import ReplApp
+
+        app = ReplApp(providers=[])
+        app._stream_block = None
+        app._turn_text = "previous reply text"
+
+        await app._handle_event(TurnComplete(1), "", 0)
+
+        assert app._turn_text == ""
+        assert app._stream_block is None

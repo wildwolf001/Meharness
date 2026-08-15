@@ -1,7 +1,3 @@
-# 来源：公众号@小林coding
-# 后端八股网站：xiaolincoding.com
-# Agent网站：xiaolinnote.com
-# 简历模版：jianli.xiaolinnote.com
 """TUI overlay 交互层（观感对齐 Claude Code）。
 
 Overlay 渲染由 FullscreenScreen 覆写内容区完成；本模块提供具体 overlay 与

@@ -1,8 +1,3 @@
-# 来源：公众号@小林coding
-# 后端八股网站：xiaolincoding.com
-# Agent网站：xiaolinnote.com
-# 简历模版：jianli.xiaolinnote.com
-
 from __future__ import annotations
 
 import os
@@ -15,11 +10,15 @@ from meharness.context.manager import (
     AGGREGATE_CHAR_LIMIT,
     KEEP_MAX_TOKENS,
     KEEP_RECENT_TOKENS,
+    MAX_THINKING_BLOCK_CHARS,
+    MAX_THINKING_BLOCKS,
     MIN_KEEP_MESSAGES,
+    OLD_ASSISTANT_SNIP_CHARS,
     PERSISTED_TAG,
     SINGLE_RESULT_CHAR_LIMIT,
     CompactCircuitBreaker,
     _align_keep_start_to_tool_pair,
+    _collapse_thinking_blocks,
     _compute_keep_start_index,
     apply_tool_result_budget,
     auto_compact,
@@ -37,6 +36,7 @@ from meharness.conversation import (
     _TEXT_BYTES_PER_TOKEN,
     ConversationManager,
     Message,
+    ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
     estimate_tokens,
@@ -769,3 +769,113 @@ class TestAutoCompactKeepRecent:
         assert result.boundary.summary == "PREFIX SUMMARY"
         # 保留的尾部与原样沿用下来的内容完全一致。
         assert result.boundary.keep == kept_before
+
+
+# ---------------------------------------------------------------------------
+# thinking 块裁剪（CTX-10：DeepSeek reasoning 是上下文膨胀主凶）
+# ---------------------------------------------------------------------------
+
+class TestThinkingCollapse:
+    def test_single_oversized_block_collapsed(self) -> None:
+        """超大 thinking 块折叠为头部 + 标记，保 signature。"""
+        tb = ThinkingBlock(thinking="x" * (MAX_THINKING_BLOCK_CHARS + 5000), signature="sig-1")
+        out, changed = _collapse_thinking_blocks([tb])
+        assert changed
+        assert len(out) == 1
+        assert "(thinking collapsed)" in out[0].thinking
+        assert len(out[0].thinking) < MAX_THINKING_BLOCK_CHARS + 100
+        assert out[0].signature == "sig-1"
+
+    def test_small_blocks_untouched(self) -> None:
+        tb = ThinkingBlock(thinking="short", signature="")
+        out, changed = _collapse_thinking_blocks([tb])
+        assert not changed
+        assert out == [tb]
+
+    def test_excess_blocks_dropped(self) -> None:
+        blocks = [ThinkingBlock(thinking=f"t{i}", signature=f"s{i}") for i in range(5)]
+        out, changed = _collapse_thinking_blocks(blocks)
+        assert changed
+        assert len(out) == MAX_THINKING_BLOCKS
+
+    def test_apply_budget_collapses_thinking_even_short_session(self, tmp_path) -> None:
+        """即使回合数很少（< KEEP_RECENT_TURNS），thinking 仍被裁剪——
+        这是全局 Pass 0，DeepSeek 单回合 2 万 token reasoning 短会话也撑爆。"""
+        conv = ConversationManager()
+        conv.add_assistant_message(
+            "assistant text",
+            tool_uses=[ToolUseBlock("t1", "ReadFile", {})],
+            thinking_blocks=[ThinkingBlock(thinking="z" * 30000, signature="s")],
+        )
+        conv.add_tool_results_message([ToolResultBlock("t1", "result", is_error=False)])
+        api_conv, _ = apply_tool_result_budget(conv, tmp_path, create_replacement_state())
+        tb = api_conv.history[0].thinking_blocks[0]
+        assert "(thinking collapsed)" in tb.thinking
+        assert len(tb.thinking) < 30000
+
+
+# ---------------------------------------------------------------------------
+# 中断合成缺失 tool_result（P1-5：对齐 claude yieldMissingToolResultBlocks）
+# ---------------------------------------------------------------------------
+
+class TestSynthesizeInterruptedToolResults:
+    def test_pending_tool_use_gets_synthesized_error(self) -> None:
+        conv = ConversationManager()
+        conv.add_assistant_message(
+            "doing work",
+            tool_uses=[ToolUseBlock("t1", "Bash", {})],
+        )
+        conv.synthesize_interrupted_tool_results()
+        last = conv.history[-1]
+        assert last.role == "user"
+        assert len(last.tool_results) == 1
+        assert last.tool_results[0].tool_use_id == "t1"
+        assert last.tool_results[0].is_error
+
+    def test_already_paired_is_noop(self) -> None:
+        conv = ConversationManager()
+        conv.add_assistant_message(
+            "doing work",
+            tool_uses=[ToolUseBlock("t1", "Bash", {})],
+        )
+        conv.add_tool_results_message([ToolResultBlock("t1", "ok", is_error=False)])
+        conv.synthesize_interrupted_tool_results()
+        # 已配对则不再追加
+        assert len(conv.history) == 2
+
+    def test_no_tool_uses_is_noop(self) -> None:
+        conv = ConversationManager()
+        conv.add_assistant_message("just text")
+        conv.synthesize_interrupted_tool_results()
+        assert len(conv.history) == 1
+
+
+# ---------------------------------------------------------------------------
+# 旧回合 assistant 文本精简（对齐 claude microcompact：上下文满得快的根因）
+# ---------------------------------------------------------------------------
+
+class TestSnipOldAssistantText:
+    def test_old_assistant_replies_condensed(self, tmp_path) -> None:
+        """超过 KEEP_RECENT_TURNS 的旧回合 assistant 正文被精简为头部，
+        最近的回合保持完整。"""
+        conv = ConversationManager()
+        for i in range(12):
+            conv.add_user_message(f"q{i}")
+            conv.add_assistant_message("R" * (OLD_ASSISTANT_SNIP_CHARS + 2000))
+        api_conv, _ = apply_tool_result_budget(conv, tmp_path, create_replacement_state())
+        assistants = [m for m in api_conv.history if m.role == "assistant"]
+        # 旧回合被精简
+        assert "旧回复已精简" in assistants[0].content
+        assert len(assistants[0].content) < OLD_ASSISTANT_SNIP_CHARS + 100
+        # 最近回合保持完整
+        assert "旧回复已精简" not in assistants[-1].content
+        assert assistants[-1].content == "R" * (OLD_ASSISTANT_SNIP_CHARS + 2000)
+
+    def test_short_replies_untouched(self, tmp_path) -> None:
+        conv = ConversationManager()
+        for i in range(12):
+            conv.add_user_message(f"q{i}")
+            conv.add_assistant_message("short reply")
+        api_conv, _ = apply_tool_result_budget(conv, tmp_path, create_replacement_state())
+        assistants = [m for m in api_conv.history if m.role == "assistant"]
+        assert all(a.content == "short reply" for a in assistants)

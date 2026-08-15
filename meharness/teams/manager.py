@@ -1,7 +1,3 @@
-# 来源：公众号@小林coding
-# 后端八股网站：xiaolincoding.com
-# Agent网站：xiaolinnote.com
-# 简历模版：jianli.xiaolinnote.com
 from __future__ import annotations
 
 import json
@@ -25,12 +21,41 @@ from meharness.teams.spawn_inprocess import InProcessTeammateHandle
 
 if TYPE_CHECKING:
     from meharness.agent import Agent
+    from meharness.tools import ToolRegistry
 
 log = logging.getLogger(__name__)
 
 
 class TeamError(Exception):
     pass
+
+
+# 主 agent 的本地任务板保留名：单 agent 也能用 TaskCreate 规划拆解（不依赖团队）。
+# Task* 工具对 team_name == MAIN_AGENT_TEAM 时落到 ~/.meharness/teams/main/tasks.json，
+# 与任何真实团队隔离。
+MAIN_AGENT_TEAM = "main"
+
+
+def register_main_agent_task_tools(
+    registry: ToolRegistry, team_manager: "TeamManager", agent_name: str = "meharness"
+) -> None:
+    """把 Task* 规划工具注册进主 agent 的工具集（本地任务板，无需建团队）。
+
+    系统提示词指示主 agent "用 TaskCreate 拆解工作"，但此前 Task* 只注册给
+    子 agent/队友，主 agent 调不到 → 模型想规划也无从下手。这里补上。
+    """
+    from meharness.tools.task_create import TaskCreateTool
+    from meharness.tools.task_get import TaskGetTool
+    from meharness.tools.task_list import TaskListTool
+    from meharness.tools.task_update import TaskUpdateTool
+
+    for tool in (
+        TaskCreateTool(team_manager, MAIN_AGENT_TEAM, agent_name),
+        TaskGetTool(team_manager, MAIN_AGENT_TEAM),
+        TaskListTool(team_manager, MAIN_AGENT_TEAM),
+        TaskUpdateTool(team_manager, MAIN_AGENT_TEAM),
+    ):
+        registry.register(tool)
 
 
 class TeamManager:
@@ -110,6 +135,14 @@ class TeamManager:
         tasks_path = team_dir / "tasks.json"
         if tasks_path.exists():
             store = SharedTaskStore(tasks_path)
+            self._task_stores[team_name] = store
+            return store
+        # 主 agent 本地任务板：懒创建。单 agent 用 TaskCreate 规划拆解时
+        # team_name=MAIN_AGENT_TEAM，无需先建团队。
+        if team_name == MAIN_AGENT_TEAM:
+            team_dir.mkdir(parents=True, exist_ok=True)
+            store = SharedTaskStore(tasks_path)
+            store.init_empty()
             self._task_stores[team_name] = store
             return store
         return None

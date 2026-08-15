@@ -1,7 +1,3 @@
-# 来源：公众号@小林coding
-# 后端八股网站：xiaolincoding.com
-# Agent网站：xiaolinnote.com
-# 简历模版：jianli.xiaolinnote.com
 from __future__ import annotations
 
 import asyncio
@@ -63,6 +59,9 @@ MEMORY_EXTRACTION_INTERVAL = 5
 MAX_TOKENS_CEILING = 64000
 MAX_OUTPUT_TOKENS_RECOVERIES = 3
 MAX_EMPTY_RESPONSE_RETRIES = 2  # 空响应（无文本无工具）重试上限，防模型空转
+# 权限面板等待超时（秒）：UI 面板挂死/被遮挡时自动拒绝，否则 agent 永久等
+# future，表现成"跑着卡住"。AskUserQuestion 用独立的 300s。
+PERMISSION_PROMPT_TIMEOUT = 120
 
 
 # ---------------------------------------------------------------------------
@@ -1019,7 +1018,14 @@ class Agent:
                     arguments=tc.arguments,
                 )
                 yield req
-                response = await future
+                try:
+                    # 面板等待加超时：UI 卡死/被覆盖时自动拒绝，避免 agent
+                    # 永久等 future（曾表现为权限弹窗异常后"跑着卡住"）。
+                    response = await asyncio.wait_for(
+                        future, timeout=PERMISSION_PROMPT_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    response = PermissionResponse.DENY
 
                 if response == PermissionResponse.DENY:
                     result = ToolResult(

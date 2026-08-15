@@ -1,7 +1,3 @@
-# 来源：公众号@小林coding
-# 后端八股网站：xiaolincoding.com
-# Agent网站：xiaolinnote.com
-# 简历模版：jianli.xiaolinnote.com
 """终端"选中即复制"（全屏模式版）。
 
 坐标用 buffer 坐标：(row, col)，row 是 screen.buffer 的行索引，col 是

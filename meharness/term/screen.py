@@ -1,7 +1,3 @@
-# 来源：公众号@小林coding
-# 后端八股网站：xiaolincoding.com
-# Agent网站：xiaolinnote.com
-# 简历模版：jianli.xiaolinnote.com
 """FullscreenScreen —— 自研全屏重绘 TUI 渲染器（观感对齐 Claude Code）。
 
 模型：
@@ -201,8 +197,10 @@ class Overlay:
     """内容区之上的一层临时 UI（面板/横幅），对齐 Claude Code 的交互层。
 
     渲染：``lines(width)`` 返回要覆写到内容区的行；``anchor_top`` 决定从哪行
-    开始（默认居中，横幅锚顶）。按键优先路由给栈顶 overlay（``on_key`` 返回
-    True 表示消费）。overlay 行不进 buffer，滚动/选区不受影响。
+    开始。**交互面板默认贴底**（紧靠输入框上方/上下文末尾，对齐 claude 的
+    命令面板和 AskUserQuestion 就地弹出），横幅（``centered()`` 返回 False）
+    锚顶。按键优先路由给栈顶 overlay（``on_key`` 返回 True 表示消费）。
+    overlay 行不进 buffer，滚动/选区不受影响。
     """
 
     def lines(self, width: int) -> list[str]:
@@ -214,7 +212,9 @@ class Overlay:
     def anchor_top(self, content_h: int, width: int) -> int:
         ls = self.lines(width)
         if self.centered():
-            return max(1, (content_h - len(ls)) // 2 + 1)
+            # 交互面板：贴内容区底部（最后一行对齐内容区底，紧靠输入框上方）。
+            # 之前居中导致面板悬浮在屏幕中间、和正在阅读的上下文脱节。
+            return max(1, content_h - len(ls) + 1)
         return 1
 
     async def on_key(self, key) -> bool:
