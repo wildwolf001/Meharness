@@ -106,13 +106,14 @@ async def test_no_usage_anywhere_still_yields_stream_end() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stream_idle_timeout_raises(monkeypatch) -> None:
-    """流式 120s（测试里调小）无任何字节 → 抛 NetworkError 而不是挂死。"""
+async def test_stream_idle_timeout_falls_back_to_nonstream(monkeypatch) -> None:
+    """流式首字节超时（无任何内容）→ 自动非流式兜底，而不是挂死或直接失败。"""
     import asyncio
 
     import meharness.client as C
 
     monkeypatch.setattr(C, "_STREAM_IDLE_TIMEOUT", 0.05)
+    monkeypatch.setattr(C, "_STREAM_TTFB_TIMEOUT", 0.05)
     client = OpenAICompatClient(_cfg())
 
     class _Never:
@@ -120,14 +121,35 @@ async def test_stream_idle_timeout_raises(monkeypatch) -> None:
             return self
 
         async def __anext__(self):
-            await asyncio.sleep(10)  # 永不返回
+            await asyncio.sleep(10)  # 流式永不返回
 
-    client._client.chat.completions.create = AsyncMock(return_value=_Never())
+    class _NonstreamResp:
+        def __init__(self):
+            msg = SimpleNamespace(
+                content="fallback text", tool_calls=None, reasoning_content=None
+            )
+            self.choices = [SimpleNamespace(message=msg, finish_reason="stop")]
+            self.usage = SimpleNamespace(
+                prompt_tokens=5, completion_tokens=3, prompt_tokens_details=None
+            )
+
+    async def fake_create(**kw):
+        if kw.get("stream"):
+            return _Never()
+        return _NonstreamResp()
+
+    client._client.chat.completions.create = fake_create
     from meharness.conversation import ConversationManager
 
-    with pytest.raises(C.NetworkError):
-        async for _ in client.stream(ConversationManager(), system=""):
-            pass
+    text = ""
+    ends = 0
+    async for ev in client.stream(ConversationManager(), system=""):
+        if isinstance(ev, TextDelta):
+            text += ev.text
+        elif isinstance(ev, StreamEnd):
+            ends += 1
+    assert text == "fallback text"  # 非流式兜底产出了内容
+    assert ends == 1
 
 
 @pytest.mark.asyncio

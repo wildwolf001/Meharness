@@ -17,6 +17,7 @@ from meharness.conversation import (
     ConversationManager,
     Message,
     ToolResultBlock,
+    ToolUseBlock,
     estimate_tokens,
 )
 from meharness.serialization import build_messages
@@ -232,6 +233,48 @@ def _copy_message_with_results(
     )
 
 
+def _copy_message(
+    msg: Message,
+    new_uses: list[ToolUseBlock],
+    new_results: list[ToolResultBlock],
+) -> Message:
+    return Message(
+        role=msg.role,
+        content=msg.content,
+        tool_uses=new_uses,
+        tool_results=new_results,
+        thinking_blocks=list(msg.thinking_blocks),
+    )
+
+
+def _truncate_tool_uses(
+    tool_uses: list[ToolUseBlock],
+) -> tuple[list[ToolUseBlock], bool]:
+    """旧回合的 tool_call 参数截断：WriteFile 等大参数（完整文件内容）只保留
+    定位字段 + 占位，避免历史全量重发把上下文撑爆。参数保持合法 dict（序列化
+    仍是合法 JSON），tool_use_id 不变。"""
+    changed = False
+    out: list[ToolUseBlock] = []
+    for tu in tool_uses:
+        serialized = json.dumps(tu.arguments, ensure_ascii=False)
+        if len(serialized) > OLD_RESULT_SNIP_CHARS:
+            new_args: dict[str, Any] = {}
+            for k, v in tu.arguments.items():
+                if isinstance(v, str) and len(v) > 200:
+                    new_args[k] = f"[truncated {len(v)} chars]"
+                else:
+                    new_args[k] = v
+            out.append(ToolUseBlock(
+                tool_use_id=tu.tool_use_id,
+                tool_name=tu.tool_name,
+                arguments=new_args,
+            ))
+            changed = True
+        else:
+            out.append(tu)
+    return out, changed
+
+
 def _snip_stale_messages(
     history: list[Message],
 ) -> list[Message]:
@@ -246,12 +289,13 @@ def _snip_stale_messages(
     for msg in history:
         if msg.role == "assistant" and not msg.tool_uses:
             turns_seen += 1
-        if turns_seen > old_boundary or not msg.tool_results:
-            out.append(msg)
+        if turns_seen > old_boundary:
+            out.append(msg)  # 近回合：原样保留
             continue
 
+        # 旧回合：裁剪 tool 结果 + 截断 tool 调用参数（WriteFile 大内容）
         new_results: list[ToolResultBlock] = []
-        changed = False
+        results_changed = False
         for tr in msg.tool_results:
             if (
                 tr.content.startswith(SNIPPED_TAG)
@@ -273,9 +317,13 @@ def _snip_stale_messages(
                 content=new_content,
                 is_error=tr.is_error,
             ))
-            changed = True
+            results_changed = True
 
-        out.append(_copy_message_with_results(msg, new_results) if changed else msg)
+        new_uses, uses_changed = _truncate_tool_uses(msg.tool_uses)
+        if results_changed or uses_changed:
+            out.append(_copy_message(msg, new_uses, new_results))
+        else:
+            out.append(msg)
 
     return out
 

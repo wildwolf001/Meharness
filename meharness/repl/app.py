@@ -1054,6 +1054,18 @@ class ReplApp:
         if text:
             prefetch_task = asyncio.create_task(self._prefetch(text))
 
+        # 状态栏心跳：LLM 调用期间（尤其 DeepSeek TTFB 数十秒时）每秒刷新状态栏
+        # elapsed，避免屏幕静止让用户以为卡死。
+        async def _status_ticker() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(1)
+                    self._update_status(render=True)
+            except asyncio.CancelledError:
+                pass
+
+        ticker_task = asyncio.create_task(_status_ticker())
+
         self._thinking_start = _time.monotonic()
         self._thinking_verb = "Working"
         self._thinking_accum = ""
@@ -1114,6 +1126,7 @@ class ReplApp:
             self.stream.commit_text(f"  ✖ {e}")
         finally:
             self._streaming = False
+            ticker_task.cancel()
             self._render_input()
             # 预取本轮没用上且还没跑完：取消，避免后台任务泄漏（对齐 claude-code
             # 的 MemoryPrefetch 在生成器退出时 dispose）。

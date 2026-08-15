@@ -92,6 +92,9 @@ class StreamEnd:
     stop_reason: str
     input_tokens: int = 0
     output_tokens: int = 0
+    # 本次响应是否收到过 reasoning_content（即使 thinking=False 未显示）。
+    # 用于区分"模型在推理"与"真·空响应"——否则空响应恢复会误触发。
+    saw_reasoning: bool = False
     # API 返回的 prompt cache 用量。Anthropic 把缓存前缀 token 分为
     # "read"（cache 命中，按 10% 计费）和 "creation"（cache 写入）。
     # input_tokens 已排除这两部分，因此实际 prompt 大小 =

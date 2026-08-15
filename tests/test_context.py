@@ -108,6 +108,84 @@ class TestApplyToolResultBudget:
         assert conv.history[0].tool_results[0].content == big_content  # 原始内容未被改动
         assert len(records) == 1 and records[0].tool_use_id == "toolu_big"
 
+    def test_old_tool_use_arguments_truncated(self, tmp_path: Path) -> None:
+        """旧回合的 tool_call 参数（WriteFile 完整内容）应被截断，避免上下文全量重发。"""
+        conv = ConversationManager()
+        big_args = {"file_path": "E:/x.py", "content": "y" * 5000}
+        conv.history.append(
+            Message(
+                role="assistant",
+                content="write file",
+                tool_uses=[
+                    ToolUseBlock(
+                        tool_use_id="tu_write",
+                        tool_name="WriteFile",
+                        arguments=big_args,
+                    )
+                ],
+            )
+        )
+        # 11 个普通回合（使 WriteFile 消息落在旧回合区）
+        for i in range(11):
+            conv.history.append(Message(role="user", content=f"msg {i}"))
+            conv.history.append(Message(role="assistant", content=f"answer {i}"))
+        conv.history.append(
+            Message(
+                role="user",
+                content="",
+                tool_results=[ToolResultBlock(tool_use_id="tu_write", content="ok")],
+            )
+        )
+        state = create_replacement_state()
+
+        api_conv, _ = apply_tool_result_budget(conv, tmp_path, state)
+
+        found = False
+        for m in api_conv.history:
+            for tu in m.tool_uses:
+                if tu.tool_use_id == "tu_write":
+                    assert "[truncated 5000 chars]" in tu.arguments["content"]
+                    assert tu.arguments["file_path"] == "E:/x.py"  # 定位字段保留
+                    found = True
+        assert found, "tool_use 未被处理"
+
+    def test_recent_tool_use_untouched(self, tmp_path: Path) -> None:
+        """近回合的 tool_call 参数不应被截断（模型还需要完整内容）。"""
+        conv = ConversationManager()
+        # 10 个普通回合 + 1 个近的 WriteFile
+        for i in range(10):
+            conv.history.append(Message(role="user", content=f"msg {i}"))
+            conv.history.append(Message(role="assistant", content=f"answer {i}"))
+        conv.history.append(
+            Message(
+                role="assistant",
+                content="write",
+                tool_uses=[
+                    ToolUseBlock(
+                        tool_use_id="tu_write",
+                        tool_name="WriteFile",
+                        arguments={"file_path": "E:/x.py", "content": "y" * 5000},
+                    )
+                ],
+            )
+        )
+        conv.history.append(
+            Message(
+                role="user",
+                content="",
+                tool_results=[ToolResultBlock(tool_use_id="tu_write", content="ok")],
+            )
+        )
+        state = create_replacement_state()
+
+        api_conv, _ = apply_tool_result_budget(conv, tmp_path, state)
+        for m in api_conv.history:
+            for tu in m.tool_uses:
+                if tu.tool_use_id == "tu_write":
+                    assert tu.arguments["content"] == "y" * 5000  # 未截断
+                    return
+        assert False, "tool_use 未找到"
+
     def test_under_limit_untouched(self, tmp_path: Path) -> None:
         conv = ConversationManager()
         small_content = "x" * 100

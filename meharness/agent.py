@@ -191,6 +191,7 @@ class LLMResponse:
     output_tokens: int = 0
     cache_read: int = 0
     cache_creation: int = 0
+    saw_reasoning: bool = False  # 是否收到过 reasoning（区分推理 vs 真·空响应）
 
 
 class StreamCollector:
@@ -227,6 +228,7 @@ class StreamCollector:
                 self.response.output_tokens = event.output_tokens
                 self.response.cache_read = event.cache_read
                 self.response.cache_creation = event.cache_creation
+                self.response.saw_reasoning = event.saw_reasoning
 
 
 # ---------------------------------------------------------------------------
@@ -690,6 +692,8 @@ class Agent:
             if (
                 not response.text
                 and not response.tool_calls
+                and not response.thinking_blocks
+                and not response.saw_reasoning
                 and empty_retries < MAX_EMPTY_RESPONSE_RETRIES
             ):
                 empty_retries += 1

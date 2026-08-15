@@ -12,8 +12,10 @@ from typing import Any, AsyncIterator
 from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 
-# 流式空闲超时（秒）：provider 在此时间内无任何字节则判为挂起。
-# DeepSeek 偶发无响应时 AsyncOpenAI 默认会等 10 分钟，agent 表现为"卡死不动"。
+# 流式超时（秒）：
+# - 首字节（TTFB）：复杂任务上下文大，DeepSeek 可能数十秒才发首个 chunk，给足余量
+# - 后续分片：已开始输出后 N 秒无字节才判挂起
+_STREAM_TTFB_TIMEOUT = 300
 _STREAM_IDLE_TIMEOUT = 120
 
 from meharness.config import ProviderConfig
@@ -489,11 +491,8 @@ class OpenAICompatClient(LLMClient):
         import openai as _openai
 
         messages = build_chat_completion_messages(conversation.get_messages())
-
-        # 如果有 system 消息则插入到消息列表头部。
         if system:
             messages = [{"role": "system", "content": system}] + messages
-
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -504,127 +503,19 @@ class OpenAICompatClient(LLMClient):
         if tools:
             kwargs["tools"] = self._convert_tools(tools)
 
-        # 用于累积 streaming tool call 的状态。Chat Completions 流按
-        # tool_calls 列表中的位置索引下发 delta，我们按索引跟踪每个进行中的调用。
-        active_calls: dict[int, dict[str, str]] = {}  # 索引 -> {id, name, args}
-        # 思考内容（DeepSeek 等通过 reasoning_content 下发）：累积并在正文开始时收尾。
-        thinking_accum = ""
-        thinking_flushed = False
-
-        last_usage = None
         try:
-            response = await self._client.chat.completions.create(**kwargs)
-            # 空闲超时：流式 120s 内无任何字节则判为挂起（DeepSeek 偶发无响应时
-            # AsyncOpenAI 默认会等 10 分钟，agent 看起来"卡死不动"）。
-            response_iter = response.__aiter__()
-
-            async def _next() -> Any:
-                try:
-                    return await asyncio.wait_for(
-                        response_iter.__anext__(), timeout=_STREAM_IDLE_TIMEOUT
-                    )
-                except StopAsyncIteration:
-                    raise
-                except asyncio.TimeoutError:
-                    raise NetworkError(
-                        f"LLM stream idle timeout ({_STREAM_IDLE_TIMEOUT}s no data)"
-                    ) from None
-
-            while True:
-                try:
-                    chunk = await _next()
-                except StopAsyncIteration:
-                    break
-                if chunk.usage:
-                    # 记录 usage：DeepSeek 等 provider 可能把 usage 挂在最后一个
-                    # content chunk 上（choices 非空），而非独立 usage-only chunk。
-                    last_usage = chunk.usage
-                if not chunk.choices:
-                    continue
-
-                choice = chunk.choices[0]
-                delta = choice.delta
-
-                # --- 思考内容（DeepSeek reasoning_content）---
-                # 能力声明关闭时（thinking=False）不显示推理，像 Claude Code 接
-                # 第三方模型默认关闭一致；reasoning_content 仍被跳过不污染正文。
-                if delta and getattr(delta, "reasoning_content", None):
-                    if self.thinking:
-                        thinking_accum += delta.reasoning_content
-                        yield ThinkingDelta(text=delta.reasoning_content)
-                    continue
-
-                # --- 文本内容 ---
-                if delta and delta.content:
-                    # 思考结束：先收尾思考块
-                    if self.thinking and thinking_accum and not thinking_flushed:
-                        thinking_flushed = True
-                        yield ThinkingComplete(thinking=thinking_accum, signature="")
-                    yield TextDelta(text=delta.content)
-
-                # --- tool call 增量 ---
-                if delta and delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        idx = tc.index
-                        if idx not in active_calls:
-                            active_calls[idx] = {"id": "", "name": "", "args": ""}
-                        call = active_calls[idx]
-
-                        if tc.id:
-                            call["id"] = tc.id
-                        if tc.function and tc.function.name:
-                            call["name"] = tc.function.name
-                            yield ToolCallStart(
-                                tool_name=call["name"],
-                                tool_id=call["id"],
-                            )
-                        if tc.function and tc.function.arguments:
-                            call["args"] += tc.function.arguments
-                            yield ToolCallDelta(text=tc.function.arguments)
-
-                # --- 结束原因 ---
-                if choice.finish_reason in ("tool_calls", "stop"):
-                    # 思考未收尾（如直接进 tool call）→ 补发 ThinkingComplete
-                    if self.thinking and thinking_accum and not thinking_flushed:
-                        thinking_flushed = True
-                        yield ThinkingComplete(thinking=thinking_accum, signature="")
-                    if choice.finish_reason == "tool_calls":
-                        for _idx, call in sorted(active_calls.items()):
-                            try:
-                                args = json.loads(call["args"]) if call["args"] else {}
-                            except json.JSONDecodeError:
-                                args = {}
-                            yield ToolCallComplete(
-                                tool_id=call["id"],
-                                tool_name=call["name"],
-                                arguments=args,
-                            )
-                        active_calls.clear()
-
-            # 兜底 StreamEnd：provider 若不送独立 usage-only chunk（DeepSeek 的
-            # usage 常挂在最后 content chunk 上，可能被上面跳过），循环结束后也
-            # 必须发出 StreamEnd，否则 agent 拿不到 stop_reason/usage，表现为
-            # "✻ Done (in 0 · out 0)"（usage 缺失）甚至整轮无响应。
-            if last_usage is not None:
-                details = getattr(last_usage, "prompt_tokens_details", None)
-                cache_read = getattr(details, "cached_tokens", 0) or 0
-                prompt_tokens = last_usage.prompt_tokens or 0
-                yield StreamEnd(
-                    stop_reason="end_turn",
-                    input_tokens=max(prompt_tokens - cache_read, 0),
-                    output_tokens=last_usage.completion_tokens or 0,
-                    cache_read=cache_read,
-                    cache_creation=0,
-                )
-            else:
-                yield StreamEnd(
-                    stop_reason="end_turn",
-                    input_tokens=0,
-                    output_tokens=0,
-                    cache_read=0,
-                    cache_creation=0,
-                )
-
+            # 流式优先；首字节超时/空响应（未产出任何内容）→ 非流式兜底
+            # （对齐 claude-code：流式失败回退一次性请求，规避兼容层流式怪癖）。
+            yielded_any = False
+            try:
+                async for ev in self._stream_events(kwargs):
+                    yielded_any = True
+                    yield ev
+            except NetworkError:
+                if yielded_any:
+                    raise  # 已产出部分内容，无法干净回退 → 交给上层重试
+                async for ev in self._nonstream_events(kwargs):
+                    yield ev
         except _openai.AuthenticationError as e:
             raise AuthenticationError(f"Invalid API key: {e}") from e
         except _openai.RateLimitError as e:
@@ -639,6 +530,190 @@ class OpenAICompatClient(LLMClient):
             raise NetworkError(f"Network error: {e}") from e
         except _openai.APIStatusError as e:
             raise LLMError(f"API error ({e.status_code}): {e.message}") from e
+
+    async def _stream_events(
+        self, kwargs: dict[str, Any]
+    ) -> AsyncIterator[StreamEvent]:
+        """流式请求：逐 chunk 解析成 StreamEvent。"""
+        # 用于累积 streaming tool call 的状态。Chat Completions 流按
+        # tool_calls 列表中的位置索引下发 delta，我们按索引跟踪每个进行中的调用。
+        active_calls: dict[int, dict[str, str]] = {}
+        thinking_accum = ""
+        thinking_flushed = False
+        last_usage = None
+        saw_reasoning = False  # 收到过 reasoning_content（thinking=False 也计数）
+        final_stop_reason = "end_turn"
+
+        response = await self._client.chat.completions.create(**kwargs)
+        # 空闲超时（自适应）：首字节给足 TTFB（复杂任务上下文大，DeepSeek 可能
+        # 数十秒才发首个 chunk，120s 会误判挂起 → 触发重试叠加 → "卡住+开始 retry"）。
+        response_iter = response.__aiter__()
+        first_byte = True
+
+        async def _next() -> Any:
+            nonlocal first_byte
+            timeout = _STREAM_TTFB_TIMEOUT if first_byte else _STREAM_IDLE_TIMEOUT
+            first_byte = False
+            try:
+                return await asyncio.wait_for(
+                    response_iter.__anext__(), timeout=timeout
+                )
+            except StopAsyncIteration:
+                raise
+            except asyncio.TimeoutError:
+                raise NetworkError(
+                    f"LLM stream idle timeout ({timeout}s no data)"
+                ) from None
+
+        while True:
+            try:
+                chunk = await _next()
+            except StopAsyncIteration:
+                break
+            if chunk.usage:
+                last_usage = chunk.usage
+            if not chunk.choices:
+                continue
+
+            choice = chunk.choices[0]
+            delta = choice.delta
+
+            # --- 思考内容（DeepSeek reasoning_content）---
+            if delta and getattr(delta, "reasoning_content", None):
+                saw_reasoning = True  # 即使 thinking=False 未显示也算"模型在推理"
+                if self.thinking:
+                    thinking_accum += delta.reasoning_content
+                    yield ThinkingDelta(text=delta.reasoning_content)
+                continue
+
+            # --- 文本内容 ---
+            if delta and delta.content:
+                if self.thinking and thinking_accum and not thinking_flushed:
+                    thinking_flushed = True
+                    yield ThinkingComplete(thinking=thinking_accum, signature="")
+                yield TextDelta(text=delta.content)
+
+            # --- tool call 增量 ---
+            if delta and delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in active_calls:
+                        active_calls[idx] = {"id": "", "name": "", "args": ""}
+                    call = active_calls[idx]
+                    if tc.id:
+                        call["id"] = tc.id
+                    if tc.function and tc.function.name:
+                        call["name"] = tc.function.name
+                        yield ToolCallStart(tool_name=call["name"], tool_id=call["id"])
+                    if tc.function and tc.function.arguments:
+                        call["args"] += tc.function.arguments
+                        yield ToolCallDelta(text=tc.function.arguments)
+
+            # --- 结束原因 ---
+            # 传播真实 stop_reason（openai-compat 的 finish_reason：stop/length/
+            # tool_calls）——否则撞 max_tokens（length）被当成 end_turn，走不了
+            # 64k 升级，模型部分输出被误判"空响应"重试。
+            if choice.finish_reason:
+                final_stop_reason = {
+                    "stop": "end_turn",
+                    "length": "max_tokens",
+                    "tool_calls": "tool_use",
+                }.get(choice.finish_reason, "end_turn")
+            if choice.finish_reason in ("tool_calls", "stop"):
+                if self.thinking and thinking_accum and not thinking_flushed:
+                    thinking_flushed = True
+                    yield ThinkingComplete(thinking=thinking_accum, signature="")
+                if choice.finish_reason == "tool_calls":
+                    for _idx, call in sorted(active_calls.items()):
+                        try:
+                            args = json.loads(call["args"]) if call["args"] else {}
+                        except json.JSONDecodeError:
+                            args = {}
+                        yield ToolCallComplete(
+                            tool_id=call["id"], tool_name=call["name"], arguments=args
+                        )
+                    active_calls.clear()
+
+        # 兜底 StreamEnd：provider 若不送独立 usage-only chunk（DeepSeek 的
+        # usage 常挂在最后 content chunk 上），循环结束后也必发。
+        if last_usage is not None:
+            details = getattr(last_usage, "prompt_tokens_details", None)
+            cache_read = getattr(details, "cached_tokens", 0) or 0
+            prompt_tokens = last_usage.prompt_tokens or 0
+            yield StreamEnd(
+                stop_reason=final_stop_reason,
+                input_tokens=max(prompt_tokens - cache_read, 0),
+                output_tokens=last_usage.completion_tokens or 0,
+                cache_read=cache_read,
+                cache_creation=0,
+                saw_reasoning=saw_reasoning,
+            )
+        else:
+            yield StreamEnd(
+                stop_reason=final_stop_reason,
+                input_tokens=0,
+                output_tokens=0,
+                cache_read=0,
+                cache_creation=0,
+                saw_reasoning=saw_reasoning,
+            )
+
+    async def _nonstream_events(
+        self, kwargs: dict[str, Any]
+    ) -> AsyncIterator[StreamEvent]:
+        """非流式兜底：stream=False 一次性请求，产出与流式等价的 StreamEvent。"""
+        nk = dict(kwargs)
+        nk["stream"] = False
+        nk.pop("stream_options", None)
+        resp = await self._client.chat.completions.create(**nk)
+        choice = resp.choices[0]
+        msg = choice.message
+        saw_reasoning = bool(getattr(msg, "reasoning_content", None))
+        stop_reason = {
+            "stop": "end_turn",
+            "length": "max_tokens",
+            "tool_calls": "tool_use",
+        }.get(choice.finish_reason, "end_turn")
+
+        if getattr(msg, "reasoning_content", None) and self.thinking:
+            yield ThinkingComplete(thinking=msg.reasoning_content, signature="")
+        if msg.content:
+            yield TextDelta(text=msg.content)
+        for tc in (msg.tool_calls or []):
+            try:
+                args = (
+                    json.loads(tc.function.arguments)
+                    if tc.function and tc.function.arguments
+                    else {}
+                )
+            except json.JSONDecodeError:
+                args = {}
+            yield ToolCallComplete(
+                tool_id=tc.id or "",
+                tool_name=tc.function.name if tc.function else "",
+                arguments=args,
+            )
+        usage = resp.usage
+        if usage is not None:
+            details = getattr(usage, "prompt_tokens_details", None)
+            cache_read = getattr(details, "cached_tokens", 0) or 0
+            yield StreamEnd(
+                stop_reason=stop_reason,
+                input_tokens=max((usage.prompt_tokens or 0) - cache_read, 0),
+                output_tokens=usage.completion_tokens or 0,
+                cache_read=cache_read,
+                cache_creation=0,
+                saw_reasoning=saw_reasoning,
+            )
+        else:
+            yield StreamEnd(
+                stop_reason=stop_reason,
+                input_tokens=0,
+                output_tokens=0,
+                cache_read=0,
+                cache_creation=0,
+                saw_reasoning=saw_reasoning,
+            )
 
 
 def create_client(config: ProviderConfig) -> LLMClient:
