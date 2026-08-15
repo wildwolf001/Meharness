@@ -40,6 +40,12 @@ def main() -> None:
         default=None,
         help="Run non-interactively: execute the prompt and print the result to stdout",
     )
+    parser.add_argument(
+        "--ui",
+        choices=["stream", "textual"],
+        default="stream",
+        help="TUI 实现：stream(行流式,默认) 或 textual(旧 Textual UI)",
+    )
     args = parser.parse_args()
 
     try:
@@ -63,10 +69,30 @@ def main() -> None:
         asyncio.run(_run_prompt(config, permission_mode, hook_engine, args.p))
         return
 
-    from meharness.app import MeharnessApp
-    from meharness.driver import NoAltScreenDriver
+    if args.ui == "textual":
+        # 旧 Textual UI（回退）
+        from meharness.app import MeharnessApp
+        from meharness.driver import NoAltScreenDriver
 
-    app = MeharnessApp(
+        app = MeharnessApp(
+            providers=config.providers,
+            permission_mode=permission_mode,
+            mcp_servers=config.mcp_servers,
+            hook_engine=hook_engine,
+            enable_fork=config.enable_fork,
+            enable_verification_agent=config.enable_verification_agent,
+            worktree_config=config.worktree,
+            teammate_mode=config.teammate_mode,
+            enable_coordinator_mode=config.enable_coordinator_mode,
+            driver_class=NoAltScreenDriver,
+        )
+        app.run()
+        return
+
+    # 默认：行流式 TUI
+    from meharness.repl.app import ReplApp
+
+    app = ReplApp(
         providers=config.providers,
         permission_mode=permission_mode,
         mcp_servers=config.mcp_servers,
@@ -76,9 +102,8 @@ def main() -> None:
         worktree_config=config.worktree,
         teammate_mode=config.teammate_mode,
         enable_coordinator_mode=config.enable_coordinator_mode,
-        driver_class=NoAltScreenDriver,
     )
-    app.run()
+    asyncio.run(app.run())
 
 
 async def _run_prompt(config, permission_mode, hook_engine, prompt: str) -> None:
@@ -178,6 +203,8 @@ async def _run_prompt(config, permission_mode, hook_engine, prompt: str) -> None
                 f"<status>{t.status}</status>\n<result>{t.result}</result>\n"
                 f"</task-notification>"
             )
+            # 无头路径也要把完成队友置 idle，否则 TeamDelete 会因 active 成员失败
+            team_manager.on_teammate_completed(t.agent.agent_id)
         notes.extend(team_manager.drain_lead_mailbox())
         return notes
 

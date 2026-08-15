@@ -87,19 +87,14 @@ class TaskManager:
                 result = await bg.agent.run_to_completion(bg.task)
             bg.result = result
             bg.status = "completed"
+            await self._notify_queue.put(task_id)
 
+            # 完成后保持在线等待 lead 的 follow-up 指令；每完成一段 follow-up
+            # 推一次通知（与初始完成分开，避免把同一事件喂 lead 两次）。
+            # 不再往 lead 邮箱写 [idle] 消息——task-notification 是唯一完成通道。
             if bg.agent.team_name and bg.agent._team_manager:
                 mailbox = bg.agent._team_manager.get_mailbox(bg.agent.team_name)
                 if mailbox:
-                    from meharness.teams.mailbox import create_message
-                    msg = create_message(
-                        from_agent=bg.name,
-                        to_agent="lead",
-                        content=f"[idle] {bg.name}: completed initial task",
-                        summary=f"{bg.name} idle",
-                    )
-                    mailbox.write("lead", msg)
-
                     for _ in range(60):
                         await asyncio.sleep(1)
                         msgs = mailbox.consume(bg.agent.agent_id)
@@ -110,27 +105,22 @@ class TaskManager:
                         )
                         result = await bg.agent.run_to_completion(prompt)
                         bg.result = result
-                        msg = create_message(
-                            from_agent=bg.name,
-                            to_agent="lead",
-                            content=f"[idle] {bg.name}: completed follow-up",
-                            summary=f"{bg.name} idle",
-                        )
-                        mailbox.write("lead", msg)
+                        await self._notify_queue.put(task_id)
 
         except asyncio.CancelledError:
             bg.status = "cancelled"
             bg.result = "Task was cancelled"
+            await self._notify_queue.put(task_id)
         except Exception as e:
             log.error("Background task %s failed: %s", task_id, e)
             bg.status = "failed"
             bg.result = f"Error: {e}"
+            await self._notify_queue.put(task_id)
         finally:
             bg.end_time = time.monotonic()
             bg.progress.input_tokens = bg.agent.total_input_tokens
             bg.progress.output_tokens = bg.agent.total_output_tokens
             self._async_tasks.pop(task_id, None)
-            await self._notify_queue.put(task_id)
 
 
     def adopt_running(

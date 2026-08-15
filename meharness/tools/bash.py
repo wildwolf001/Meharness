@@ -75,15 +75,31 @@ class Bash(Tool):
         import os
         import shutil
         import sys
+        from pathlib import Path
 
         timeout = min(params.timeout, MAX_TIMEOUT)
 
         # Windows 上 `asyncio.create_subprocess_shell` 默认用 cmd.exe，而 agent 按
         # bash 语法写命令（ls/find/管道/环境变量），cmd 必然失败。有 git bash 时
         # 用 `bash -c` 执行，保证 Unix 命令可用；否则退回 cmd。
+        #
+        # 检测顺序：PATH 里的 bash → 由 `git` 安装位置反推（非标准安装如
+        # D:\git\Git，PATH 里只有 cmd 目录，没有 bash.exe）→ 常见默认路径。
         executable = None
         if sys.platform == "win32":
             bash = shutil.which("bash")
+            if bash is None:
+                git = shutil.which("git")
+                if git:
+                    # git 在 ...\Git\cmd\git.exe → 安装根 = parents[1]
+                    git_root = Path(git).resolve().parents[1]
+                    for cand in (
+                        git_root / "bin" / "bash.exe",
+                        git_root / "usr" / "bin" / "bash.exe",
+                    ):
+                        if cand.exists():
+                            bash = str(cand)
+                            break
             if bash is None:
                 for cand in (
                     r"C:\Program Files\Git\bin\bash.exe",

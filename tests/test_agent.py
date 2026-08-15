@@ -149,6 +149,15 @@ async def test_multi_step_autonomous():
     conv = ConversationManager()
     conv.add_user_message("Create hello.txt with Hello World, then verify")
 
+    # 幂等：上一轮运行可能已创建该文件，先删掉，否则 WriteFile 会因
+    # read-before-write 状态缓存（文件已存在但本会话未读过）而报错。
+    import os
+    target = "/tmp/meharness_test_hello.txt"
+    try:
+        os.unlink(target)
+    except FileNotFoundError:
+        pass
+
     events = []
     async for e in agent.run(conv):
         events.append(e)
@@ -163,6 +172,75 @@ async def test_multi_step_autonomous():
     # 验证文件确实被创建了
     assert not c["tool_result"][0].is_error
     assert not c["tool_result"][1].is_error
+
+class _RateLimitOnceClient(LLMClient):
+    """第一次调用抛 RateLimitError，之后正常——验证指数退避重试。"""
+
+    def __init__(self, ok_responses: list[list[StreamEvent]]) -> None:
+        self._ok = ok_responses
+        self._calls = 0
+
+    async def stream(
+        self,
+        conversation: ConversationManager,
+        system: str = "",
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        self._calls += 1
+        if self._calls == 1:
+            from meharness.client import RateLimitError
+
+            raise RateLimitError("rate limited", retry_after=0.01)
+        for e in self._ok:
+            yield e
+
+
+@pytest.mark.asyncio
+async def test_transient_error_retried():
+    """限流/网络瞬时错误应指数退避重试，而不是直接终止回合。"""
+    client = _RateLimitOnceClient([
+        TextDelta("Recovered after rate limit."),
+        StreamEnd("end_turn", input_tokens=10, output_tokens=5),
+    ])
+    registry = create_default_registry()
+    agent = Agent(client, registry, "anthropic")
+    conv = ConversationManager()
+    conv.add_user_message("Do something")
+
+    events = []
+    async for e in agent.run(conv):
+        events.append(e)
+
+    c = _collect(events)
+    assert client._calls == 2  # 第一次失败 + 重试成功
+    assert len(c["loop"]) == 1  # 回合正常完成
+    assert "Recovered after rate limit" in "".join(c["text"])
+    assert len(c["error"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_empty_response_recovered():
+    """空响应（无文本无工具）应触发恢复重试，而不是静默停止。"""
+    client = MockLLMClient([
+        [StreamEnd("end_turn", input_tokens=1, output_tokens=1)],  # 空响应
+        [
+            TextDelta("Proceeding now."),
+            StreamEnd("end_turn", input_tokens=2, output_tokens=2),
+        ],
+    ])
+    registry = create_default_registry()
+    agent = Agent(client, registry, "anthropic")
+    conv = ConversationManager()
+    conv.add_user_message("Do something")
+
+    events = []
+    async for e in agent.run(conv):
+        events.append(e)
+
+    c = _collect(events)
+    assert len(c["loop"]) == 1  # 没有停在空响应上
+    assert "Proceeding now" in "".join(c["text"])
+
 
 @pytest.mark.asyncio
 async def test_stop_end_turn():
@@ -315,16 +393,61 @@ async def test_message_splicing():
 
     # 检查对话历史
     msgs = build_anthropic_messages(conv.get_messages())
-    # env_context(user) + user_message + assistant(text+2 个 tool_use) + user(2 个 tool_result) + assistant(最终响应)
-    assert len(msgs) == 5
-    assistant_msg = msgs[2]
+    # build_anthropic_messages 会把相邻的 user 纯文本消息合并（env_context + 用户提问
+    # 合成一条）。所以是 4 条：user(合并) + assistant(text+2 tool_use) + user(2 tool_result) + assistant(最终)
+    assert len(msgs) == 4
+    assert msgs[0]["role"] == "user"
+    assert "Read both files" in msgs[0]["content"]  # 合并后用户提问仍在
+    assistant_msg = msgs[1]
     assert assistant_msg["role"] == "assistant"
     assert len(assistant_msg["content"]) == 3  # text + 2 个 tool_use
-    tool_results_msg = msgs[3]
+    tool_results_msg = msgs[2]
     assert tool_results_msg["role"] == "user"
     assert len(tool_results_msg["content"]) == 2  # 2 个 tool_result
     assert tool_results_msg["content"][0]["tool_use_id"] == "t1"
     assert tool_results_msg["content"][1]["tool_use_id"] == "t2"
+
+@pytest.mark.asyncio
+async def test_askuser_question_yields_event_not_crash():
+    """AskUserQuestion 必须 yield AskUserEvent 交给 app 挂弹窗，而非被当
+    (result, elapsed, is_unknown) 元组解包。回归保护曾出现的
+    "cannot unpack non-iterable AskUserEvent object" 崩溃。
+    """
+    from meharness.tools.ask_user import AskUserEvent, AskUserTool
+
+    client = MockLLMClient([
+        [
+            TextDelta("I need to ask."),
+            ToolCallComplete(
+                "t1",
+                "AskUserQuestion",
+                {"questions": [
+                    {"type": "radio", "name": "choice",
+                     "message": "选哪个?", "options": ["A", "B"]}
+                ]},
+            ),
+            StreamEnd("end_turn", input_tokens=10, output_tokens=20),
+        ],
+        [TextDelta("Done."), StreamEnd("end_turn", input_tokens=30, output_tokens=10)],
+    ])
+    registry = create_default_registry()
+    registry.register(AskUserTool())
+    agent = Agent(client, registry, "anthropic", work_dir=".")
+    conv = ConversationManager()
+    conv.add_user_message("Ask me")
+
+    seen_events = []
+    tool_results = []
+    async for e in agent.run(conv):
+        if isinstance(e, AskUserEvent):
+            seen_events.append(e)
+            e.future.set_result({"choice": "A"})  # app 挂弹窗后回填答案
+        elif isinstance(e, ToolResultEvent):
+            tool_results.append(e)
+
+    # 事件被正确向上 yield，且整个 run 跑完（此前这里会抛 TypeError）
+    assert len(seen_events) == 1
+    assert any("choice: A" in tr.output for tr in tool_results)
 
 @pytest.mark.asyncio
 async def test_concurrent_batch_execution():
@@ -495,3 +618,85 @@ def test_environment_context():
     assert "/home/user/project" in ctx
     assert "Operating system" in ctx
     assert "Current time" in ctx
+
+# ---------------------------------------------------------------------------
+# run_to_completion 的 max_tokens 升级/恢复（无头/队友路径对齐交互式 run()）
+# ---------------------------------------------------------------------------
+
+class EscalatingMockClient(LLMClient):
+    """首次响应撞 max_tokens；set_max_output_tokens 被调用后返回完整结果。"""
+
+    def __init__(self) -> None:
+        self.call_count = 0
+        self.escalated = False
+
+    async def stream(
+        self,
+        conversation: ConversationManager,
+        system: str = "",
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        self.call_count += 1
+        if self.call_count == 1:
+            yield TextDelta("partial output before cap")
+            yield StreamEnd("max_tokens", input_tokens=10, output_tokens=8192)
+        else:
+            yield TextDelta("full output after escalation")
+            yield StreamEnd("end_turn", input_tokens=20, output_tokens=30)
+
+    def set_max_output_tokens(self, tokens: int) -> None:
+        self.escalated = True
+
+
+@pytest.mark.asyncio
+async def test_run_to_completion_escalates_max_tokens():
+    """无头路径撞 max_tokens 时升级到 64k 同请求重试，不把截断当最终答案。"""
+    client = EscalatingMockClient()
+    agent = Agent(client, create_default_registry(), "anthropic", work_dir=".")
+    result = await agent.run_to_completion("write a long response")
+    assert client.escalated is True
+    assert client.call_count == 2
+    assert "full output after escalation" in result
+
+
+class RecoveringMockClient(LLMClient):
+    """连续撞顶两次（8k→64k 都撞）后恢复：验证部分输出被追加进对话再续写。"""
+
+    def __init__(self) -> None:
+        self.call_count = 0
+
+    async def stream(
+        self,
+        conversation: ConversationManager,
+        system: str = "",
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        self.call_count += 1
+        if self.call_count == 1:
+            yield TextDelta("first cut ")
+            yield StreamEnd("max_tokens", input_tokens=10, output_tokens=8192)
+        elif self.call_count == 2:
+            yield TextDelta("second cut ")
+            yield StreamEnd("max_tokens", input_tokens=10, output_tokens=64000)
+        else:
+            yield TextDelta("final full output")
+            yield StreamEnd("end_turn", input_tokens=20, output_tokens=30)
+
+    def set_max_output_tokens(self, tokens: int) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_run_to_completion_recovers_partial_output():
+    """64k 仍撞顶时保留部分输出 + 续写消息，让模型接着写而不是从头。"""
+    client = RecoveringMockClient()
+    agent = Agent(client, create_default_registry(), "anthropic", work_dir=".")
+    conv = ConversationManager()
+    conv.add_user_message("long task")
+    result = await agent.run_to_completion("", conv)
+    assert client.call_count == 3
+    assert "final full output" in result
+    # 首次 8k 撞顶是同请求升级（不保留输出）；64k 再撞才把部分输出追加进对话续写
+    assistant_texts = [m.content for m in conv.history if m.role == "assistant"]
+    assert "second cut" in assistant_texts[0]
+    assert "final full output" in assistant_texts[1]

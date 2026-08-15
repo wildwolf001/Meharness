@@ -14,6 +14,7 @@ from typing import Any
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.events import MouseDown, MouseMove, MouseUp
 from textual.message import Message as TMessage
 from textual.widgets import Markdown, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
@@ -90,11 +91,21 @@ from meharness.worktree.cleanup import start_stale_cleanup_task
 from meharness.worktree.manager import WorktreeManager
 from meharness.commands.handlers.worktree import create_worktree_command
 from meharness.teammate_tree import TeammateTree
+from meharness.ui.clipboard import set_clipboard
+from meharness.ui.selection import SelectionOverlay, SelectionState, extract_selected_text
 
 import re
 
 MAX_TRUNCATED_LINES = 20
 MAX_AT_REF_BYTES = 10240
+DRAG_THRESHOLD = 2  # 拖拽超过 2 格才算"选区"，否则视为点击
+
+
+def _fmt_k(n: int) -> str:
+    """把 token 数格式化成 12.3k 样式（千位）。"""
+    if n >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
 
 _AT_REF_RE = re.compile(r"@([\w./_\-]+(?:\.[\w]+)*)")
 
@@ -368,10 +379,12 @@ class ToolCallBlock(Static, can_focus=True):
         self._elapsed = 0.0
         self._collapsed = True
         self._loading = True
+        self._displayed = ""
         self._render_loading()
 
     def _render_loading(self) -> None:
-        self.update(f"  ● {self._title} …")
+        self._displayed = f"  ● {self._title} …"
+        self.update(self._displayed)
         self.add_class("tool-block-loading")
 
     def set_result(self, output: str, is_error: bool, elapsed: float) -> None:
@@ -387,9 +400,10 @@ class ToolCallBlock(Static, can_focus=True):
 
     def _render_collapsed(self) -> None:
         if self._is_error:
-            self.update(f"  ✗ {self._title} ({self._elapsed:.1f}s)")
+            self._displayed = f"  ✗ {self._title} ({self._elapsed:.1f}s)"
         else:
-            self.update(f"  ✓ {self._title} ({self._elapsed:.1f}s)")
+            self._displayed = f"  ✓ {self._title} ({self._elapsed:.1f}s)"
+        self.update(self._displayed)
 
     def _render_expanded(self) -> None:
         if self._is_error:
@@ -397,7 +411,12 @@ class ToolCallBlock(Static, can_focus=True):
         else:
             header = f"  ✓ {self._title} ({self._elapsed:.1f}s)"
         detail = _format_detail(self.tool_name, self._arguments, self._full_output)
-        self.update(f"{header}\n{detail}")
+        self._displayed = f"{header}\n{detail}"
+        self.update(self._displayed)
+
+    def selection_text(self) -> str:
+        """选区提取时自报当前显示文本（折叠=标题，展开=标题+细节）。"""
+        return self._displayed
 
     def on_click(self) -> None:
         if self._loading:
@@ -472,15 +491,21 @@ class ToolGroupSummary(Static, can_focus=True):
         self._count = count
         self._total = total_elapsed
         self._expanded = False
+        self._displayed = label
+        self._refresh_display()
 
     def _refresh_display(self) -> None:
         if self._expanded:
-            self.update(f"▼ Done ({self._count} tool uses · {self._total:.1f}s)")
+            self._displayed = f"▼ Done ({self._count} tool uses · {self._total:.1f}s)"
         else:
-            self.update(
+            self._displayed = (
                 f"● Done ({self._count} tool uses · {self._total:.1f}s)"
                 "  (ctrl+o to expand)"
             )
+        self.update(self._displayed)
+
+    def selection_text(self) -> str:
+        return self._displayed
 
     def toggle(self) -> None:
         self._expanded = not self._expanded
@@ -503,11 +528,13 @@ class SubAgentBlock(Static, can_focus=True):
         self._collapsed = True
         self._result_preview = ""
         self._tool_count = 0
+        self._displayed = ""
         self._render_running()
 
     def _render_running(self) -> None:
         desc = f"({self._description})" if self._description else ""
-        self.update(f"● {self._agent_type}{desc}\n     Running…")
+        self._displayed = f"● {self._agent_type}{desc}\n     Running…"
+        self.update(self._displayed)
 
     def set_result(self, output: str, is_error: bool, elapsed: float) -> None:
         self._done = True
@@ -527,16 +554,20 @@ class SubAgentBlock(Static, can_focus=True):
         desc = f"({self._description})" if self._description else ""
         tool_info = f"{self._tool_count} tool uses · " if self._tool_count else ""
         if self._collapsed:
-            self.update(
+            self._displayed = (
                 f"● {self._agent_type}{desc}\n"
                 f"    ⎿  Done ({tool_info}{self._elapsed:.1f}s)  (ctrl+o to expand)"
             )
         else:
-            self.update(
+            self._displayed = (
                 f"● {self._agent_type}{desc}\n"
                 f"    ⎿  Done ({tool_info}{self._elapsed:.1f}s)\n"
                 f"  {self._result_preview}"
             )
+        self.update(self._displayed)
+
+    def selection_text(self) -> str:
+        return self._displayed
 
     def on_click(self) -> None:
         if not self._done:
@@ -635,6 +666,11 @@ class MeharnessApp(App):
         self._mcp_connecting: bool = False
         self._teammate_tree: TeammateTree | None = None
         self._teammate_timer = None
+        # --- 拖拽选区（选中即复制）---
+        self._selection = SelectionState()
+        self._selection_blocks: dict[int, str] = {}
+        self._selection_overlay: SelectionOverlay | None = None
+        self._last_selection_text = ""
 
     @staticmethod
     def _make_banner(model: str = "", work_dir: str = "") -> RichText:
@@ -920,6 +956,11 @@ class MeharnessApp(App):
             self._start_notification_polling()
         )
 
+        # 挂载拖拽选区 overlay（默认隐藏；不拖拽时不占布局、不接收鼠标）
+        self._selection_overlay = SelectionOverlay(self._selection)
+        self.mount(self._selection_overlay)
+        self._selection_overlay.display = False
+
     async def _resolve_context_window(self, provider: ProviderConfig) -> None:
         """Layer 2 后台 worker：异步拉取模型的 context window，
         拉到就原地升级 agent 的窗口值。
@@ -1143,11 +1184,13 @@ class MeharnessApp(App):
                 t.append("∴ Thinking… ", style="dim italic")
                 t.append("(ctrl+o)", style="dim")
                 self._thinking_widget.update(t)
+                self._register_block(self._thinking_widget, "∴ Thinking… (ctrl+o)")
                 self._thinking_expanded = False
             else:
                 t = RichText()
                 t.append(self._thinking_accum, style="dim italic")
                 self._thinking_widget.update(t)
+                self._register_block(self._thinking_widget, self._thinking_accum)
                 self._thinking_expanded = True
             self.call_after_refresh(self._thinking_widget.scroll_end, animate=False)
             return
@@ -1265,6 +1308,7 @@ class MeharnessApp(App):
             user_rich.append(text, style="bold color(255)")
             user_bubble = Static(user_rich, classes="message user-message")
             await user_row.mount(user_bubble)
+            self._register_block(user_bubble, text)
             self.call_after_refresh(chat.scroll_end, animate=False)
 
             self.conversation.add_user_message(text)
@@ -1331,6 +1375,7 @@ class MeharnessApp(App):
                     t.append("∴ Thinking… ", style="dim italic")
                     t.append("(ctrl+o)", style="dim")
                     self._thinking_widget.update(t)
+                    self._register_block(self._thinking_widget, "∴ Thinking… (ctrl+o)")
                     self.call_after_refresh(chat.scroll_end, animate=False)
 
                 elif isinstance(event, StreamText):
@@ -1358,6 +1403,7 @@ class MeharnessApp(App):
                         await ai_row.mount(prefix)
                         md = Markdown(accumulated_text, classes="message ai-message")
                         await ai_row.mount(md)
+                        self._register_block(md, accumulated_text)
                         streaming_label = None
                         accumulated_text = ""
                     elif streaming_label is not None:
@@ -1450,10 +1496,17 @@ class MeharnessApp(App):
 
                 elif isinstance(event, LoopComplete):
                     total_time = _time.monotonic() - self._thinking_start
-                    done_label = Static(
-                        f"✻ {_to_past_tense(self._thinking_verb)} for {total_time:.1f}s",
-                        classes="message thinking-done",
+                    done_text = (
+                        f"✻ {_to_past_tense(self._thinking_verb)} "
+                        f"for {total_time:.1f}s"
                     )
+                    # 轻量 token 反馈（对齐 claude-code 的用量展示，不硬编码成本）
+                    if self.agent:
+                        done_text += (
+                            f"  (in {_fmt_k(self.agent.total_input_tokens)}"
+                            f" · out {_fmt_k(self.agent.total_output_tokens)})"
+                        )
+                    done_label = Static(done_text, classes="message thinking-done")
                     await ai_row.mount(done_label)
                     if self.session:
                         for msg in self.conversation.history[history_cursor:]:
@@ -1476,6 +1529,7 @@ class MeharnessApp(App):
                 await streaming_label.remove()
                 md = Markdown(accumulated_text, classes="message ai-message")
                 await ai_row.mount(md)
+                self._register_block(md, accumulated_text)
             elif streaming_label is not None:
                 await streaming_label.remove()
 
@@ -1490,6 +1544,7 @@ class MeharnessApp(App):
                     classes="message ai-message",
                 )
                 await ai_row.mount(md)
+                self._register_block(md, accumulated_text + "\n\n*[cancelled]*")
                 # 状态保留：把被打断的部分回复写进会话，下一轮能基于它续接，
                 # 而不是当什么都没发生过（参照 claude-code 的优雅中断）。
                 try:
@@ -1783,11 +1838,13 @@ class MeharnessApp(App):
                 user_rich.append(msg.content, style="bold color(255)")
                 bubble = Static(user_rich, classes="message user-message")
                 await row.mount(bubble)
+                self._register_block(bubble, msg.content)
             elif msg.role == "assistant":
                 row = Vertical(classes="ai-row")
                 await chat.mount(row)
                 md = Markdown(msg.content, classes="message ai-message")
                 await row.mount(md)
+                self._register_block(md, msg.content)
 
         self.call_after_refresh(chat.scroll_end, animate=False)
 
@@ -1881,9 +1938,19 @@ class MeharnessApp(App):
             except Exception:
                 pass
             return
-        # 空闲时 Ctrl+C 不再退出——终端里 Ctrl+C 是复制，与退出语义冲突。
-        # 退出请输入 exit（或 /exit、/quit）。
-        self._show_system_message("Ctrl+C = 复制/中断；退出请输入 exit")
+        # 空闲时 Ctrl+C 复制最近一次拖拽选中的内容（与终端 Ctrl+C 语义一致）；
+        # 没有选区则提示。退出请输入 exit（或 /exit、/quit）。
+        if self._last_selection_text:
+            try:
+                set_clipboard(self._last_selection_text)
+            except Exception as e:
+                self._show_system_message(f"复制失败: {e}")
+            else:
+                self._show_system_message(
+                    f"已复制选中内容（{len(self._last_selection_text)} 字符）"
+                )
+        else:
+            self._show_system_message("Ctrl+C = 复制/中断；退出请输入 exit")
 
     async def _request_exit(self) -> None:
         """统一退出路径：先中断流式响应，再执行清理（记忆抽取、hooks、
@@ -1952,9 +2019,66 @@ class MeharnessApp(App):
             chat = self.query_one("#chat-area", VerticalScroll)
             widget = Static(content, classes=classes)
             chat.mount(widget)
+            self._register_block(widget, content)
             self.call_after_refresh(chat.scroll_end, animate=False)
         except Exception:
             pass
+
+    def _register_block(self, widget, text: str) -> None:
+        """登记消息块的纯文本，供拖拽选区提取用（id 在 widget 存活期内稳定）。"""
+        if widget is not None:
+            self._selection_blocks[id(widget)] = text
+
+    # -----------------------------------------------------------------
+    # 拖拽选区（选中即复制，保留鼠标点击交互）
+    # -----------------------------------------------------------------
+
+    def on_mouse_down(self, event: MouseDown) -> None:
+        if event.button == 0:  # 左键按下，仅记录锚点；是否成选区由拖拽阈值决定
+            self._selection.start(event.screen_x, event.screen_y)
+
+    def on_mouse_move(self, event: MouseMove) -> None:
+        if not self._selection.active:
+            return
+        self._selection.update(event.screen_x, event.screen_y)
+        if self._selection.is_drag:
+            if self._selection_overlay is not None:
+                if not self._selection_overlay.display:
+                    self._selection_overlay.display = True
+                self._selection_overlay.refresh()
+            return
+        if self._selection.anchor is not None:
+            ax, ay = self._selection.anchor
+            cx, cy = event.screen_x, event.screen_y
+            if abs(cx - ax) >= DRAG_THRESHOLD or abs(cy - ay) >= DRAG_THRESHOLD:
+                self._selection.is_drag = True
+                if self._selection_overlay is not None:
+                    self._selection_overlay.display = True
+                    self._selection_overlay.refresh()
+
+    def on_mouse_up(self, event: MouseUp) -> None:
+        if not self._selection.active:
+            return
+        if event.button == 0 and self._selection.is_drag:
+            # 先隐藏 overlay，避免 get_widget_at 命中 overlay 而不是消息块
+            if self._selection_overlay is not None:
+                self._selection_overlay.display = False
+            self._selection.update(event.screen_x, event.screen_y)
+            text = extract_selected_text(
+                self.screen, self._selection, self._selection_blocks
+            )
+            self._selection.clear()
+            if text and text.strip():
+                self._last_selection_text = text
+                try:
+                    set_clipboard(text)
+                except Exception as e:
+                    self._show_system_message(f"复制失败: {e}")
+                else:
+                    self._show_system_message(f"已复制选中内容（{len(text)} 字符）")
+            event.stop()  # 选区吞掉点击，避免误触工具块折叠
+        else:
+            self._selection.clear()
 
     _MODE_DISPLAY = {
         PermissionMode.DEFAULT: "default",

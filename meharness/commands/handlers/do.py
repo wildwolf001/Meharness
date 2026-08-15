@@ -1,0 +1,25 @@
+# 来源：公众号@小林coding
+# 后端八股网站：xiaolincoding.com
+# Agent网站：xiaolinnote.com
+# 简历模版：jianli.xiaolinnote.com
+
+from __future__ import annotations
+
+from meharness.commands.registry import Command, CommandContext, CommandType
+
+
+async def handle_do(ctx: CommandContext) -> None:
+    ctx.ui.set_plan_mode(False)
+    ctx.ui.add_system_message("已退出 Plan 模式，切回执行模式")
+    if ctx.args:
+        ctx.ui.send_user_message(ctx.args)
+
+
+DO_COMMAND = Command(
+    name="do",
+    aliases=["d"],
+    description="退出 Plan 模式，切回执行模式",
+    usage="/do [任务描述]",
+    type=CommandType.LOCAL_UI,
+    handler=handle_do,
+)

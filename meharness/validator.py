@@ -35,6 +35,10 @@ MODEL_CONTEXT_WINDOWS: list[tuple[str, int]] = [
     ("o4", 200_000),
     ("gpt-3.5", 16_385),
     ("claude", 200_000),
+    # DeepSeek 系列：优先于通用默认值命中，避免压缩时机错位/413。
+    # 若实际窗口不同，在 config 里显式 context_window 覆盖（最高优先级）。
+    ("deepseek", 128_000),
+    ("flash", 128_000),
 ]
 
 
@@ -87,6 +91,12 @@ def validate_providers(raw_providers: list) -> list[dict]:
         if not isinstance(thinking, bool):
             raise ConfigError(f"Provider #{i + 1}: thinking must be a boolean")
 
+        thinking_budget = entry.get("thinking_budget", 0)
+        if not isinstance(thinking_budget, int) or isinstance(thinking_budget, bool) or thinking_budget < 0:
+            raise ConfigError(
+                f"Provider #{i + 1}: thinking_budget must be a non-negative integer"
+            )
+
         max_output_tokens = entry.get("max_output_tokens", 0)
         if not isinstance(max_output_tokens, int) or max_output_tokens < 0:
             raise ConfigError(
@@ -101,6 +111,7 @@ def validate_providers(raw_providers: list) -> list[dict]:
                 "model": entry["model"],
                 "api_key": entry.get("api_key", ""),
                 "thinking": thinking,
+                "thinking_budget": thinking_budget,
                 "context_window": context_window,
                 "max_output_tokens": max_output_tokens,
             }

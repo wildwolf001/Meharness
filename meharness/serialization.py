@@ -86,13 +86,26 @@ def build_openai_input(messages: list[Message]) -> list[dict[str, Any]]:
     return result
 
 
+def _reasoning_content(m: Message) -> str | None:
+    """提取 assistant 消息里保存的思考块，供 DeepSeek 等 provider 续接。
+
+    DeepSeek 的 reasoner 模型要求多轮对话中把上一轮 assistant 的
+    reasoning_content 原样回传，否则续接会错乱/报错。Chat Completions
+    把它作为 assistant 消息的顶层字段与 content 并列。
+    """
+    if not m.thinking_blocks:
+        return None
+    joined = "\n\n".join(tb.thinking for tb in m.thinking_blocks if tb.thinking)
+    return joined or None
+
+
 def build_chat_completion_messages(messages: list[Message]) -> list[dict[str, Any]]:
     """OpenAI Chat Completions 格式。
 
     - 用户消息：{"role": "user", "content": "..."}
     - 助手文本+工具调用：{"role": "assistant", "content": "...", "tool_calls": [...]}
     - 工具结果：{"role": "tool", "tool_call_id": "...", "content": "..."}
-    - thinking 块被跳过（Chat Completions 不支持）。
+    - assistant 的思考块以 reasoning_content 字段回传（DeepSeek 续接必需）。
     """
     result: list[dict[str, Any]] = []
     for m in messages:
@@ -107,11 +120,15 @@ def build_chat_completion_messages(messages: list[Message]) -> list[dict[str, An
                         "arguments": json.dumps(tu.arguments),
                     },
                 })
-            result.append({
+            assistant: dict[str, Any] = {
                 "role": "assistant",
                 "content": m.content or None,
                 "tool_calls": tool_calls,
-            })
+            }
+            reasoning = _reasoning_content(m)
+            if reasoning:
+                assistant["reasoning_content"] = reasoning
+            result.append(assistant)
         elif m.tool_results:
             for tr in m.tool_results:
                 result.append({
@@ -120,7 +137,12 @@ def build_chat_completion_messages(messages: list[Message]) -> list[dict[str, An
                     "content": tr.content,
                 })
         else:
-            result.append({"role": m.role, "content": m.content})
+            msg: dict[str, Any] = {"role": m.role, "content": m.content}
+            if m.role == "assistant":
+                reasoning = _reasoning_content(m)
+                if reasoning:
+                    msg["reasoning_content"] = reasoning
+            result.append(msg)
     return result
 
 

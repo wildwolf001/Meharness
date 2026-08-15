@@ -576,7 +576,9 @@ async def test_e2e_bypass_mode_allows_all():
 
     client = MockLLMClient([
         [
-            ToolCallComplete("t1", "WriteFile", {
+            # 先读再写：read-before-write 状态缓存要求改已有文件前先读过
+            ToolCallComplete("t1", "ReadFile", {"file_path": str(test_file)}),
+            ToolCallComplete("t2", "WriteFile", {
                 "file_path": str(test_file),
                 "content": "modified",
             }),
@@ -603,9 +605,10 @@ async def test_e2e_bypass_mode_allows_all():
         events.append(e)
 
     c = _collect(events)
-    assert len(c["permission"]) == 0
-    assert len(c["tool_result"]) == 1
+    assert len(c["permission"]) == 0  # bypass 模式不弹权限询问
+    assert len(c["tool_result"]) == 2  # ReadFile + WriteFile
     assert not c["tool_result"][0].is_error
+    assert not c["tool_result"][1].is_error
     assert test_file.read_text() == "modified"
 
 @pytest.mark.asyncio

@@ -26,6 +26,32 @@ SESSION_SUMMARY_PROMPT = (
 
 
 # ---------------------------------------------------------------------------
+# 时间间隔提示
+# ---------------------------------------------------------------------------
+
+_TIME_GAP_THRESHOLD = timedelta(hours=24)
+
+
+def build_time_gap_message(last_active: datetime) -> Message | None:
+    """根据与上次会话的时间间隔生成一条提醒消息。
+
+    距上次会话不足一天返回 None；超过一天则返回一条 system-reminder，
+    提醒模型代码/项目状态在间隔期间可能已变更，涉及当前状态时先核对。
+    """
+    gap = datetime.now(timezone.utc) - last_active
+    if gap < _TIME_GAP_THRESHOLD:
+        return None
+    days = max(1, int(gap / timedelta(days=1)))
+    return Message(
+        role="user",
+        content=(
+            f"<system-reminder>\n距上次会话已过去约 {days} 天，代码可能有变更。"
+            "如任务涉及项目当前状态，先核对再执行。\n</system-reminder>"
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # RecordType & SessionRecord
 # ---------------------------------------------------------------------------
 

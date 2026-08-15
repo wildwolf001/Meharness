@@ -236,10 +236,9 @@ def git_repo(tmp_path):
 
 @pytest.fixture
 def manager(git_repo):
-    cache = FileCache()
+    # WorktreeManager 已不再接受 file_cache 参数（该依赖已从实现移除）
     return WorktreeManager(
         repo_root=str(git_repo),
-        file_cache=cache,
         symlink_directories=[],
     )
 
@@ -287,13 +286,6 @@ class TestWorktreeManager:
         session = loop.run_until_complete(manager.enter("enter-test"))
         assert session.worktree_name == "enter-test"
         assert manager.current_session is not None
-
-    def test_enter_clears_cache(self, manager):
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(manager.create("cache-test"))
-        manager.file_cache.put("/some/file", "old content")
-        loop.run_until_complete(manager.enter("cache-test"))
-        assert manager.file_cache.get("/some/file") is None
 
     def test_exit_keep(self, manager):
         loop = asyncio.get_event_loop()

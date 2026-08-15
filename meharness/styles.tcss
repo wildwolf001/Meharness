@@ -1,4 +1,17 @@
-Screen { }
+Screen {
+    /* 拖拽选区 overlay 挂在更高层，渲染在 chat-area 之上 */
+    layers: base overlay;
+}
+
+/* --- Selection Overlay（拖拽选区的反色高亮，默认隐藏） --- */
+
+#selection-overlay {
+    layer: overlay;
+    display: none;
+    width: 100%;
+    height: 100%;
+    background: transparent;
+}
 
 #title-bar {
     dock: top;

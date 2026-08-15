@@ -15,7 +15,7 @@ from typing import Any, AsyncIterator, Callable
 
 from pydantic import ValidationError
 
-from meharness.client import LLMClient
+from meharness.client import LLMClient, NetworkError, RateLimitError
 from meharness.context import (
     CompactBoundary,
     CompactCircuitBreaker,
@@ -43,6 +43,7 @@ from meharness.hooks import HookContext, HookEngine, ToolRejectedError
 from meharness.hooks.engine import HookNotification
 from meharness.prompts import build_environment_context, build_plan_mode_reminder, build_system_prompt
 from meharness.tools import ToolRegistry
+from meharness.tools.ask_user import AskUserEvent
 from meharness.tools.base import (
     MAX_OUTPUT_CHARS,
     StreamEnd,
@@ -61,6 +62,7 @@ log = logging.getLogger(__name__)
 MEMORY_EXTRACTION_INTERVAL = 5
 MAX_TOKENS_CEILING = 64000
 MAX_OUTPUT_TOKENS_RECOVERIES = 3
+MAX_EMPTY_RESPONSE_RETRIES = 2  # 空响应（无文本无工具）重试上限，防模型空转
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +150,9 @@ class PermissionRequest:
     tool_name: str
     description: str
     future: asyncio.Future[PermissionResponse]
+    # 待执行的工具参数。app 的权限面板可原地修改（编辑参数后允许），
+    # agent 在收到响应后读取本字段构造执行参数。
+    arguments: dict[str, Any] | None = None
 
 
 AgentEvent = (
@@ -455,6 +460,7 @@ class Agent:
         consecutive_unknown = 0
         max_tokens_escalated = False
         output_recoveries = 0
+        empty_retries = 0
 
         while True:
             iteration += 1
@@ -554,23 +560,36 @@ class Agent:
             if _new_records:
                 append_replacement_records(self.session_dir, _new_records)
 
-            collector = StreamCollector()
-            try:
-                llm_stream = self.client.stream(api_conv, system=system, tools=tools)
-                async for event in collector.consume(llm_stream):
-                    yield event
-            except Exception as _e:
-                # 响应式压缩：上下文超窗（413/context-length）→ 压缩后重试一次
-                from meharness.client import is_context_overflow_error
-                if is_context_overflow_error(_e):
-                    compact_result = await auto_compact(
-                        conversation, self.client, self.context_window, self.session_dir,
-                        protocol=self.protocol, breaker=self.compact_breaker,
-                        recovery=self.recovery_state,
-                        tool_schemas=self.registry.get_all_schemas(self.protocol),
-                        transcript_path=self._transcript_path,
+            # 兜底重试（对齐 claude-code withRetry）：
+            # - 瞬时错误（限流/网络/5xx）指数退避重试，不直接终止回合
+            # - 上下文超窗（413）→ 自动压缩后重试
+            from meharness.client import is_context_overflow_error
+
+            max_transient_retries = 5
+            transient_retries = 0
+            while True:
+                collector = StreamCollector()
+                try:
+                    llm_stream = self.client.stream(
+                        api_conv, system=system, tools=tools
                     )
-                    if isinstance(compact_result, CompactEvent):
+                    async for event in collector.consume(llm_stream):
+                        yield event
+                    response = collector.response
+                    break
+                except Exception as _e:
+                    if is_context_overflow_error(_e):
+                        # 响应式压缩：上下文超窗（413/context-length）→ 压缩后重试
+                        compact_result = await auto_compact(
+                            conversation, self.client, self.context_window,
+                            self.session_dir, protocol=self.protocol,
+                            breaker=self.compact_breaker,
+                            recovery=self.recovery_state,
+                            tool_schemas=self.registry.get_all_schemas(self.protocol),
+                            transcript_path=self._transcript_path,
+                        )
+                        if not isinstance(compact_result, CompactEvent):
+                            raise _e
                         conversation.inject_environment(env_context)
                         yield CompactNotification(
                             before_tokens=compact_result.before_tokens,
@@ -584,17 +603,29 @@ class Agent:
                             conversation, self.session_dir, self.replacement_state
                         )
                         if _new_records:
-                            append_replacement_records(self.session_dir, _new_records)
-                        collector = StreamCollector()
-                        llm_stream = self.client.stream(api_conv, system=system, tools=tools)
-                        async for event in collector.consume(llm_stream):
-                            yield event
-                    else:
-                        raise _e
-                else:
+                            append_replacement_records(
+                                self.session_dir, _new_records
+                            )
+                        continue
+                    if (
+                        isinstance(_e, (RateLimitError, NetworkError))
+                        and transient_retries < max_transient_retries
+                    ):
+                        transient_retries += 1
+                        retry_after = getattr(_e, "retry_after", None)
+                        delay = retry_after if retry_after else min(
+                            0.5 * (2 ** (transient_retries - 1)) + 0.1, 30
+                        )
+                        yield RetryEvent(
+                            reason=(
+                                f"transient error (retry "
+                                f"{transient_retries}/{max_transient_retries} "
+                                f"in {delay:.1f}s): {_e}"
+                            )
+                        )
+                        await asyncio.sleep(delay)
+                        continue
                     raise _e
-
-            response = collector.response
 
             if self.hook_engine:
                 ctx = self._build_hook_context("post_receive", message=response.text)
@@ -616,26 +647,35 @@ class Agent:
 
             if response.stop_reason == "max_tokens":
                 if not max_tokens_escalated:
+                    # 首次撞顶：同请求升级到 64k 重试，不追加任何消息——对话未变，
+                    # 下一轮重建 api_conv 即等价于"同请求以更高上限重发"。
+                    # 对应 claude-code query.ts 的 tengu_max_tokens_escalate。
                     self.client.set_max_output_tokens(MAX_TOKENS_CEILING)
                     max_tokens_escalated = True
-                    if response.text:
-                        conversation.add_assistant_message(
-                            response.text, thinking_blocks=conv_thinking
-                        )
-                        conversation.add_user_message(
-                            "Output token limit hit. Resume directly from where you stopped. "
-                            "Do not apologize or repeat previous content. Pick up mid-thought if needed."
-                        )
-                    yield RetryEvent(reason="max_tokens escalation")
+                    yield RetryEvent(reason="max_tokens escalate to 64k (same request)")
                     continue
                 elif output_recoveries < MAX_OUTPUT_TOKENS_RECOVERIES:
                     output_recoveries += 1
+                    # 64k 仍撞顶：保留部分 assistant 输出（文本 + 思考 + 已完成的
+                    # tool_calls，response.tool_calls 里的都是 JSON 完整解析成功的），
+                    # 让模型看到自己写到一半的内容再续写。
+                    # 对应 claude-code query.ts 的 max_output_tokens_recovery。
+                    partial_tool_uses = [
+                        ToolUseBlock(
+                            tool_use_id=tc.tool_id,
+                            tool_name=tc.tool_name,
+                            arguments=tc.arguments,
+                        )
+                        for tc in response.tool_calls
+                    ]
                     conversation.add_assistant_message(
-                        response.text, thinking_blocks=conv_thinking
+                        response.text,
+                        tool_uses=partial_tool_uses,
+                        thinking_blocks=conv_thinking,
                     )
                     conversation.add_user_message(
-                        "Output token limit hit. Resume directly from where you stopped. "
-                        "Break remaining work into smaller pieces."
+                        "Output token limit hit. Resume directly — no apology, no recap of what you were doing. "
+                        "Pick up mid-thought if that is where the cut happened. Break remaining work into smaller pieces."
                     )
                     yield RetryEvent(
                         reason=f"max_tokens recovery {output_recoveries}/{MAX_OUTPUT_TOKENS_RECOVERIES}"
@@ -643,6 +683,27 @@ class Agent:
                     continue
             else:
                 output_recoveries = 0
+
+            # 空响应恢复（对齐 claude-code 流式空事件检测）：无文本、无工具调用
+            # → 模型空转了（DeepSeek thinking 吃光 budget / API 异常），重试并
+            # 提示直接行动，避免"跑一回合就停、没有最终输出"。
+            if (
+                not response.text
+                and not response.tool_calls
+                and empty_retries < MAX_EMPTY_RESPONSE_RETRIES
+            ):
+                empty_retries += 1
+                conversation.add_user_message(
+                    "Your previous turn produced no text and no tool calls. "
+                    "Continue the task: give your answer or take the next concrete action directly."
+                )
+                yield RetryEvent(
+                    reason=(
+                        f"empty response (retry {empty_retries}/"
+                        f"{MAX_EMPTY_RESPONSE_RETRIES})"
+                    )
+                )
+                continue
 
             if not response.tool_calls:
                 conversation.add_assistant_message(
@@ -759,6 +820,11 @@ class Agent:
 
                         async for item in self._execute_tool(tc):
                             if isinstance(item, PermissionRequest):
+                                yield item
+                            elif isinstance(item, AskUserEvent):
+                                # AskUserQuestion 特例：先 yield 事件给 app 挂弹窗，
+                                # app 回答后 _execute_tool 里的 future 才会 resolve。
+                                # 不能当 (result, elapsed, is_unknown) 元组解包。
                                 yield item
                             else:
                                 result, elapsed, is_unknown = item
@@ -923,6 +989,7 @@ class Agent:
             return
 
         # 权限检查
+        exec_args = tc.arguments  # 权限面板可能编辑参数；默认原样执行
         if self.permission_checker:
             decision = self.permission_checker.check(tool, tc.arguments)
 
@@ -939,12 +1006,15 @@ class Agent:
                 loop = asyncio.get_running_loop()
                 future: asyncio.Future[PermissionResponse] = loop.create_future()
                 desc = self._build_permission_description(tc)
-                # 向调用方 yield 权限请求事件，由调用方处理
-                yield PermissionRequest(
+                # 向调用方 yield 权限请求事件，由调用方处理。arguments 供 app
+                # 权限面板展示/编辑；app 原地修改后这里在 await 之后读取。
+                req = PermissionRequest(
                     tool_name=tc.tool_name,
                     description=desc,
                     future=future,
+                    arguments=tc.arguments,
                 )
+                yield req
                 response = await future
 
                 if response == PermissionResponse.DENY:
@@ -958,17 +1028,19 @@ class Agent:
 
                 if response == PermissionResponse.ALLOW_ALWAYS:
                     from meharness.permissions.rules import Rule, extract_content
-                    content = extract_content(tc.tool_name, tc.arguments)
+                    content = extract_content(tc.tool_name, req.arguments)
                     pattern = f"{content[:60]}*" if len(content) > 60 else f"{content}*"
                     rule = Rule(tool_name=tc.tool_name, pattern=pattern, effect="allow")
                     self.permission_checker.rule_engine.append_local_rule(rule)
 
+                exec_args = req.arguments  # 面板编辑过的参数
+
         try:
-            params = tool.params_model.model_validate(tc.arguments)
+            # 用面板可能编辑过的参数构造执行参数
+            params = tool.params_model.model_validate(exec_args)
             # AskUserQuestion：先 yield AskUserEvent 让 app 挂载弹窗（否则 tool 阻塞
             # 等 future，而 app 又要等 tool 完成才挂弹窗 → 死锁），再 await 回答。
             if tool.name == "AskUserQuestion":
-                from meharness.tools.ask_user import AskUserEvent
                 loop = asyncio.get_running_loop()
                 future: asyncio.Future[dict[str, str]] = loop.create_future()
                 questions_data = [q.model_dump() for q in params.questions]
@@ -1109,6 +1181,8 @@ class Agent:
         )
 
         last_text = ""
+        max_tokens_escalated = False
+        output_recoveries = 0
 
         for iteration in range(1, self.max_iterations + 1):
             if self.hook_engine:
@@ -1158,6 +1232,11 @@ class Agent:
             self.total_input_tokens += response.input_tokens
             self.total_output_tokens += response.output_tokens
 
+            conv_thinking = [
+                ConvThinkingBlock(thinking=tb.thinking, signature=tb.signature)
+                for tb in response.thinking_blocks
+            ]
+
             if event_callback:
                 event_callback({
                     "type": "usage",
@@ -1181,8 +1260,42 @@ class Agent:
                 len(response.text), response.stop_reason,
             )
 
+            if response.stop_reason == "max_tokens":
+                # 对齐交互式 run()/claude-code query.ts：无头/队友路径同样
+                # 做 8k→64k 同请求升级 + 部分输出续写，避免长输出被静默截断。
+                if not max_tokens_escalated:
+                    # 首次撞顶：同请求升级到 64k 重试，不追加任何消息——对话未变，
+                    # 下一轮重建 api_conv 即等价于"同请求以更高上限重发"。
+                    self.client.set_max_output_tokens(MAX_TOKENS_CEILING)
+                    max_tokens_escalated = True
+                    continue
+                elif output_recoveries < MAX_OUTPUT_TOKENS_RECOVERIES:
+                    output_recoveries += 1
+                    partial_tool_uses = [
+                        ToolUseBlock(
+                            tool_use_id=tc.tool_id,
+                            tool_name=tc.tool_name,
+                            arguments=tc.arguments,
+                        )
+                        for tc in response.tool_calls
+                    ]
+                    conversation.add_assistant_message(
+                        response.text,
+                        tool_uses=partial_tool_uses,
+                        thinking_blocks=conv_thinking,
+                    )
+                    conversation.add_user_message(
+                        "Output token limit hit. Resume directly — no apology, no recap of what you were doing. "
+                        "Pick up mid-thought if that is where the cut happened. Break remaining work into smaller pieces."
+                    )
+                    continue
+            else:
+                output_recoveries = 0
+
             if not response.tool_calls:
-                conversation.add_assistant_message(response.text)
+                conversation.add_assistant_message(
+                    response.text, thinking_blocks=conv_thinking
+                )
                 if self.file_history is not None:
                     summary = response.text[:60] + "..." if len(response.text) > 60 else response.text
                     self.file_history.make_snapshot(len(conversation.history), summary)
@@ -1196,7 +1309,9 @@ class Agent:
                 )
                 for tc in response.tool_calls
             ]
-            conversation.add_assistant_message(response.text, tool_uses)
+            conversation.add_assistant_message(
+                response.text, tool_uses, thinking_blocks=conv_thinking
+            )
             # assistant 回复已在历史中，锚定实际用量；下一轮迭代只需对
             # 下方追加的 tool results 做字符估算。
             conversation.record_usage_anchor(
@@ -1305,14 +1420,14 @@ class Agent:
 
     def _maybe_persist_or_truncate(self, tool_use_id: str, text: str) -> str:
         from meharness.context.manager import (
-            SINGLE_RESULT_CHAR_LIMIT,
             make_persisted_preview,
             persist_tool_result,
         )
 
-        if len(text) > SINGLE_RESULT_CHAR_LIMIT:
+        # 超过内联上限即全量落盘 + 给路径预览（对应 claude-code 的
+        # persistedOutputPath 策略）。模型可 ReadFile 读取文件里的完整内容
+        # （含尾部错误/测试输出），而不是只看被截断的头部。
+        if len(text) > MAX_OUTPUT_CHARS:
             fp = persist_tool_result(tool_use_id, text, self.session_dir)
             return make_persisted_preview(text, fp)
-        if len(text) > MAX_OUTPUT_CHARS:
-            return text[:MAX_OUTPUT_CHARS] + "\n… (output truncated)"
         return text

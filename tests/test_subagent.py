@@ -589,6 +589,81 @@ class TestTaskManager:
         tm = TaskManager()
         assert tm.cancel("nope") is False
 
+    # ------------------------------------------------------------------
+    # 完成通知只入队一次（去重）：初始完成/取消/失败各 push 一次，无 finally 重复
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_completion_notifies_exactly_once(self, mock_agent):
+        tm = TaskManager()
+        tm.launch(mock_agent, "task")
+        await asyncio.sleep(0.1)
+
+        assert tm._notify_queue.qsize() == 1
+        completed = tm.poll_completed()
+        assert len(completed) == 1
+        assert tm._notify_queue.qsize() == 0
+        assert tm.poll_completed() == []
+
+    @pytest.mark.asyncio
+    async def test_cancel_notifies_exactly_once(self, mock_agent):
+        async def long_running(*a, **kw):
+            await asyncio.sleep(10)
+            return "done"
+
+        mock_agent.run_to_completion = long_running
+        tm = TaskManager()
+        task_id = tm.launch(mock_agent, "long task")
+        await asyncio.sleep(0.1)
+        assert tm.cancel(task_id) is True
+        await asyncio.sleep(0.2)
+
+        assert tm._notify_queue.qsize() == 1
+        bg = tm.poll_completed()[0]
+        assert bg.status == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_failure_notifies_exactly_once(self):
+        agent = MagicMock()
+        agent.total_input_tokens = 0
+        agent.total_output_tokens = 0
+        agent.run_to_completion = AsyncMock(side_effect=RuntimeError("boom"))
+
+        tm = TaskManager()
+        tm.launch(agent, "will fail")
+        await asyncio.sleep(0.1)
+
+        assert tm._notify_queue.qsize() == 1
+        bg = tm.poll_completed()[0]
+        assert bg.status == "failed"
+
+    @pytest.mark.asyncio
+    async def test_notify_immediate_before_followup_wait(self):
+        """团队队友：初始完成应立即入队通知，不等 follow-up 等待循环结束。"""
+        agent = MagicMock()
+        agent.total_input_tokens = 0
+        agent.total_output_tokens = 0
+        agent.run_to_completion = AsyncMock(return_value="done")
+        agent.team_name = "t"
+        team_manager = MagicMock()
+        mailbox = MagicMock()
+        mailbox.consume.return_value = []  # 无 follow-up → 循环会空等 60s
+        team_manager.get_mailbox.return_value = mailbox
+        agent._team_manager = team_manager
+
+        tm = TaskManager()
+        task_id = tm.launch(agent, "task")
+        await asyncio.sleep(0.1)
+
+        completed = tm.poll_completed()
+        assert len(completed) == 1
+        assert completed[0].id == task_id
+
+        # 清理：取消仍在 follow-up 空等循环里的后台任务
+        for t in list(tm._async_tasks.values()):
+            t.cancel()
+        await asyncio.sleep(0.1)
+
 # =====================================================================
 # 7. 通知
 # =====================================================================

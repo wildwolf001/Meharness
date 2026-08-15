@@ -4,12 +4,17 @@
 # 简历模版：jianli.xiaolinnote.com
 from __future__ import annotations
 
+import asyncio
 import json
 from abc import ABC, abstractmethod
 from typing import Any, AsyncIterator
 
 from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
+
+# 流式空闲超时（秒）：provider 在此时间内无任何字节则判为挂起。
+# DeepSeek 偶发无响应时 AsyncOpenAI 默认会等 10 分钟，agent 表现为"卡死不动"。
+_STREAM_IDLE_TIMEOUT = 120
 
 from meharness.config import ProviderConfig
 from meharness.conversation import ConversationManager
@@ -144,7 +149,8 @@ def _supports_adaptive_thinking(model: str) -> bool:
 class AnthropicClient(LLMClient):
     def __init__(self, config: ProviderConfig) -> None:
         self.model = config.model
-        self.thinking = config.thinking
+        self.thinking = config.model_supports_thinking()
+        self.thinking_budget = config.thinking_budget
         self.max_output_tokens = config.get_max_output_tokens()
         api_key = config.resolve_api_key()
         if not api_key:
@@ -208,7 +214,13 @@ class AnthropicClient(LLMClient):
             kwargs["tools"] = _mark_last_tool_for_cache(tools)
 
         if self.thinking:
-            if _supports_adaptive_thinking(self.model):
+            if self.thinking_budget > 0:
+                # 显式声明 budget：直接用它（对齐 claude 能力声明 + budget 控制）
+                kwargs["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": self.thinking_budget,
+                }
+            elif _supports_adaptive_thinking(self.model):
                 kwargs["thinking"] = {"type": "enabled", "budget_tokens": 0}
             else:
                 kwargs["thinking"] = {
@@ -427,6 +439,8 @@ class OpenAICompatClient(LLMClient):
 
     def __init__(self, config: ProviderConfig) -> None:
         self.model = config.model
+        self.thinking = config.model_supports_thinking()
+        self.thinking_budget = config.thinking_budget
         self.max_output_tokens = config.get_max_output_tokens()
         api_key = config.resolve_api_key()
         if not api_key:
@@ -497,43 +511,53 @@ class OpenAICompatClient(LLMClient):
         thinking_accum = ""
         thinking_flushed = False
 
+        last_usage = None
         try:
             response = await self._client.chat.completions.create(**kwargs)
-            async for chunk in response:
+            # 空闲超时：流式 120s 内无任何字节则判为挂起（DeepSeek 偶发无响应时
+            # AsyncOpenAI 默认会等 10 分钟，agent 看起来"卡死不动"）。
+            response_iter = response.__aiter__()
+
+            async def _next() -> Any:
+                try:
+                    return await asyncio.wait_for(
+                        response_iter.__anext__(), timeout=_STREAM_IDLE_TIMEOUT
+                    )
+                except StopAsyncIteration:
+                    raise
+                except asyncio.TimeoutError:
+                    raise NetworkError(
+                        f"LLM stream idle timeout ({_STREAM_IDLE_TIMEOUT}s no data)"
+                    ) from None
+
+            while True:
+                try:
+                    chunk = await _next()
+                except StopAsyncIteration:
+                    break
+                if chunk.usage:
+                    # 记录 usage：DeepSeek 等 provider 可能把 usage 挂在最后一个
+                    # content chunk 上（choices 非空），而非独立 usage-only chunk。
+                    last_usage = chunk.usage
                 if not chunk.choices:
-                    # 最后一个 chunk，只包含 usage 数据。
-                    if chunk.usage:
-                        # 部分兼容 provider 通过 prompt_tokens_details.cached_tokens
-                        # 上报 cache 命中数，大多数不上报（cache_read 保持 0）。
-                        # prompt_tokens 包含了缓存 token，需要减去以保持
-                        # input + cache_read 可加性。没有 provider 上报 creation 计数。
-                        details = getattr(
-                            chunk.usage, "prompt_tokens_details", None
-                        )
-                        cache_read = getattr(details, "cached_tokens", 0) or 0
-                        prompt_tokens = chunk.usage.prompt_tokens or 0
-                        yield StreamEnd(
-                            stop_reason="end_turn",
-                            input_tokens=max(prompt_tokens - cache_read, 0),
-                            output_tokens=chunk.usage.completion_tokens or 0,
-                            cache_read=cache_read,
-                            cache_creation=0,
-                        )
                     continue
 
                 choice = chunk.choices[0]
                 delta = choice.delta
 
                 # --- 思考内容（DeepSeek reasoning_content）---
+                # 能力声明关闭时（thinking=False）不显示推理，像 Claude Code 接
+                # 第三方模型默认关闭一致；reasoning_content 仍被跳过不污染正文。
                 if delta and getattr(delta, "reasoning_content", None):
-                    thinking_accum += delta.reasoning_content
-                    yield ThinkingDelta(text=delta.reasoning_content)
+                    if self.thinking:
+                        thinking_accum += delta.reasoning_content
+                        yield ThinkingDelta(text=delta.reasoning_content)
                     continue
 
                 # --- 文本内容 ---
                 if delta and delta.content:
                     # 思考结束：先收尾思考块
-                    if thinking_accum and not thinking_flushed:
+                    if self.thinking and thinking_accum and not thinking_flushed:
                         thinking_flushed = True
                         yield ThinkingComplete(thinking=thinking_accum, signature="")
                     yield TextDelta(text=delta.content)
@@ -561,7 +585,7 @@ class OpenAICompatClient(LLMClient):
                 # --- 结束原因 ---
                 if choice.finish_reason in ("tool_calls", "stop"):
                     # 思考未收尾（如直接进 tool call）→ 补发 ThinkingComplete
-                    if thinking_accum and not thinking_flushed:
+                    if self.thinking and thinking_accum and not thinking_flushed:
                         thinking_flushed = True
                         yield ThinkingComplete(thinking=thinking_accum, signature="")
                     if choice.finish_reason == "tool_calls":
@@ -576,6 +600,30 @@ class OpenAICompatClient(LLMClient):
                                 arguments=args,
                             )
                         active_calls.clear()
+
+            # 兜底 StreamEnd：provider 若不送独立 usage-only chunk（DeepSeek 的
+            # usage 常挂在最后 content chunk 上，可能被上面跳过），循环结束后也
+            # 必须发出 StreamEnd，否则 agent 拿不到 stop_reason/usage，表现为
+            # "✻ Done (in 0 · out 0)"（usage 缺失）甚至整轮无响应。
+            if last_usage is not None:
+                details = getattr(last_usage, "prompt_tokens_details", None)
+                cache_read = getattr(details, "cached_tokens", 0) or 0
+                prompt_tokens = last_usage.prompt_tokens or 0
+                yield StreamEnd(
+                    stop_reason="end_turn",
+                    input_tokens=max(prompt_tokens - cache_read, 0),
+                    output_tokens=last_usage.completion_tokens or 0,
+                    cache_read=cache_read,
+                    cache_creation=0,
+                )
+            else:
+                yield StreamEnd(
+                    stop_reason="end_turn",
+                    input_tokens=0,
+                    output_tokens=0,
+                    cache_read=0,
+                    cache_creation=0,
+                )
 
         except _openai.AuthenticationError as e:
             raise AuthenticationError(f"Invalid API key: {e}") from e

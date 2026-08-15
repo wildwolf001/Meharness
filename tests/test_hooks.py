@@ -499,6 +499,9 @@ class TestHookEngine:
         engine = HookEngine([h])
         ctx = HookContext(event_name="post_tool_use")
         await engine.run_hooks("post_tool_use", ctx)
+        # 收尾：等待后台任务完成，否则 sleep 5 子进程泄漏到下一个测试，
+        # Windows 上事件循环关闭会挂死（整个套件卡在 ~30%）。
+        await engine.wait_pending_async()
 
 # ---------------------------------------------------------------------------
 # Agent 循环集成

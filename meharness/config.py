@@ -39,6 +39,8 @@ class ProviderConfig:
     model: str
     api_key: str = ""
     thinking: bool = False
+    # thinking budget（0=未设置 → 用模型默认/上限）。对齐 claude 的能力声明机制。
+    thinking_budget: int = 0
     # 0 表示"未设置" — get_context_window() 通过四层 fallback 解析真实窗口大小。
     # 正数表示配置文件里显式指定的覆盖值。
     context_window: int = 0
@@ -53,6 +55,18 @@ class ProviderConfig:
             return self.api_key
         env_var = _ENV_KEY_MAP.get(self.protocol, "")
         return os.environ.get(env_var, "")
+
+    def model_supports_thinking(self) -> bool:
+        """模型是否声明支持 extended thinking（对齐 Claude Code 的能力声明机制）。
+
+        声明来源（任一）：config.yaml 的 ``thinking: true``，或环境变量
+        ``MEHARNESS_MODEL_SUPPORTED_CAPABILITIES``（逗号分隔，含 ``thinking``）。
+        默认（未声明）→ 不开启 —— 与 Claude Code 接第三方模型默认关闭一致。
+        """
+        if self.thinking:
+            return True
+        caps = os.environ.get("MEHARNESS_MODEL_SUPPORTED_CAPABILITIES", "").lower()
+        return "thinking" in [c.strip() for c in caps.split(",")]
 
     def set_fetched_context_window(self, window: int) -> None:
         """记录从 provider 自动拉取到的 context window（第 2 层）。
@@ -87,7 +101,7 @@ class ProviderConfig:
     def get_max_output_tokens(self) -> int:
         if self.max_output_tokens > 0:
             return self.max_output_tokens
-        if self.thinking:
+        if self.model_supports_thinking():
             return 64000
         return 8192
 
@@ -157,6 +171,7 @@ def _load_single_file(path: Path) -> AppConfig:
             model=p["model"],
             api_key=p["api_key"],
             thinking=p["thinking"],
+            thinking_budget=p.get("thinking_budget", 0),
             context_window=p["context_window"],
             max_output_tokens=p["max_output_tokens"],
         )

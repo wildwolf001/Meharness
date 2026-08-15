@@ -38,31 +38,46 @@ class Message:
     thinking_blocks: list[ThinkingBlock] = field(default_factory=list)
 
 
-# 估算最后一次 API 用量锚点之后追加的消息 token 开销时使用的字符/token 比率。
-# 与 context.manager 中的恢复状态启发值保持一致，全代码库统一使用同一比率。
-_CHARS_PER_TOKEN = 3.5
+# 本地 token 估算比率，对齐 claude-code 的 roughTokenCountEstimation
+# （services/tokenEstimation.ts）：普通文本按 UTF-8 字节数/4，JSON（工具参数）
+# 按字节数/2。字节基准天然对 CJK 更准（中文每字 3 字节 → 0.75 token/字）。
+_TEXT_BYTES_PER_TOKEN = 4.0
+_JSON_BYTES_PER_TOKEN = 2.0
 
 
-def _message_chars(m: Message) -> int:
-    n = len(m.content)
+def _utf8_len(s: str) -> int:
+    return len(s.encode("utf-8", errors="ignore"))
+
+
+def _estimate_text_tokens(text: str) -> int:
+    return int(_utf8_len(text) / _TEXT_BYTES_PER_TOKEN)
+
+
+def _estimate_json_tokens(text: str) -> int:
+    return int(_utf8_len(text) / _JSON_BYTES_PER_TOKEN)
+
+
+def _message_tokens(m: Message) -> int:
+    n = _estimate_text_tokens(m.content)
     for tb in m.thinking_blocks:
-        n += len(tb.thinking)
+        n += _estimate_text_tokens(tb.thinking)
     for tu in m.tool_uses:
-        n += len(tu.tool_name) + len(json.dumps(tu.arguments, ensure_ascii=False))
+        n += _estimate_text_tokens(tu.tool_name) + _estimate_json_tokens(
+            json.dumps(tu.arguments, ensure_ascii=False)
+        )
     for tr in m.tool_results:
-        n += len(tr.content)
+        n += _estimate_text_tokens(tr.content)
     return n
 
 
 def estimate_tokens(messages: list[Message]) -> int:
-    """基于字符数对一组消息做 token 估算。
+    """对一组消息做粗略 token 估算（字节基准）。
 
     刻意做得粗略——它只覆盖那些尚未锚定到真实 API 用量数值的消息，这部分的
     精确度本就无关紧要。统计内容包括消息正文、thinking、工具调用参数以及
     工具结果内容。
     """
-    total = sum(_message_chars(m) for m in messages)
-    return int(total / _CHARS_PER_TOKEN)
+    return sum(_message_tokens(m) for m in messages)
 
 
 @dataclass

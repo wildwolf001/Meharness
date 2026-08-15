@@ -108,7 +108,7 @@ class TestLoadConfigMCP:
                 base_url: http://localhost
                 model: gpt-4o
             mcp_servers:
-              github:
+              - name: github
                 command: npx
                 args: ["-y", "@modelcontextprotocol/server-github"]
                 env:
@@ -130,7 +130,7 @@ class TestLoadConfigMCP:
                 base_url: http://localhost
                 model: gpt-4o
             mcp_servers:
-              remote:
+              - name: remote
                 url: "https://api.example.com/mcp"
                 headers:
                   Authorization: "Bearer ${TOKEN}"
@@ -149,7 +149,7 @@ class TestLoadConfigMCP:
                 base_url: http://localhost
                 model: gpt-4o
             mcp_servers:
-              bad:
+              - name: bad
                 command: npx
                 url: "https://example.com"
         """)

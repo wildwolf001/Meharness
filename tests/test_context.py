@@ -34,7 +34,7 @@ from meharness.context.manager import (
     should_auto_compact,
 )
 from meharness.conversation import (
-    _CHARS_PER_TOKEN,
+    _TEXT_BYTES_PER_TOKEN,
     ConversationManager,
     Message,
     ToolResultBlock,
@@ -252,12 +252,11 @@ class TestCompactCircuitBreaker:
 class TestBuildCompactMessages:
     def test_basic_structure(self) -> None:
         msgs = build_compact_messages("the summary")
-        assert len(msgs) == 2
+        # 当前实现只生成一条 user 摘要消息（transcript/keep_tail/attachment 可选追加）
+        assert len(msgs) == 1
         assert msgs[0].role == "user"
-        assert "[摘要]" in msgs[0].content
+        assert "摘要" in msgs[0].content
         assert "the summary" in msgs[0].content
-        assert msgs[1].role == "assistant"
-        assert "ReadFile" in msgs[1].content
 
 # ---------------------------------------------------------------------------
 # 会话目录管理
@@ -289,8 +288,8 @@ class TestUsageAnchor:
         conv = ConversationManager()
         conv.add_user_message("x" * 350)
         assert conv.baseline_tokens == 0
-        # 350 个字符 / 3.5 == 100 个 token，与对历史调用 estimate_tokens 的结果一致。
-        assert conv.current_tokens() == estimate_tokens(conv.history) == 100
+        # 350 个字节（ASCII）/ 4 == 87 个 token，与对历史调用 estimate_tokens 的结果一致。
+        assert conv.current_tokens() == estimate_tokens(conv.history) == 87
 
     def test_anchor_aggregates_all_usage_components(self) -> None:
         """baseline = input + cache_read + cache_creation + output。"""
@@ -317,9 +316,9 @@ class TestUsageAnchor:
         # 还没有新消息 -> 正好等于基准值（不会重新估算历史）。
         assert conv.current_tokens() == baseline
 
-        # 追加一条 700 个字符的 tool result -> 在基准之上再加 200 个估算 token。
+        # 追加一条 800 字节的 tool result -> 在基准之上再加 200 个估算 token。
         conv.add_tool_results_message(
-            [ToolResultBlock(tool_use_id="t1", content="y" * 700)]
+            [ToolResultBlock(tool_use_id="t1", content="y" * 800)]
         )
         assert conv.current_tokens() == baseline + 200
         # 锚点之前的消息通过基准值采信，不再重复计数。
@@ -330,12 +329,12 @@ class TestUsageAnchor:
         """命中缓存后，真实 input（很小）所对应的锚点会低于同一段大历史按字符的估算值，
         这样就不会把缓存命中的 token 重复多算。"""
         conv = ConversationManager()
-        conv.add_user_message("z" * 35000)  # 按字符估算会得到 10000 个 token
+        conv.add_user_message("z" * 40000)  # 按字节估算会得到 10000 个 token
         # 缓存命中：prompt 的大部分是从缓存读取的，真实 input 很小。
         conv.record_usage_anchor(
             input_tokens=200, output_tokens=50, cache_read=9000
         )
-        # 锚点反映真实的 9250，而不是被夸大的按字符估算值。
+        # 锚点反映真实的 9250，而不是被夸大的按字节估算值。
         assert conv.current_tokens() == 9250
         assert conv.current_tokens() < estimate_tokens(conv.history)
 
@@ -377,8 +376,8 @@ class TestEstimateTokens:
         ]
         # text(35) + text(35)+thinking(35)+工具名/参数 + result(35)
         est = estimate_tokens(msgs)
-        # 下界：仅这四个 35 字符的块就是 140 个字符 / 3.5 = 40。
-        assert est >= int(140 / _CHARS_PER_TOKEN)
+        # 下界：仅这四个 35 字节的文本块就是 140 字节 / 4 = 35。
+        assert est >= int(140 / _TEXT_BYTES_PER_TOKEN)
 
 
 # ---------------------------------------------------------------------------
@@ -436,13 +435,13 @@ class TestStreamUsageCacheFields:
 # 保留最近原文的窗口：keepStartIndex 计算 + 工具配对
 # ---------------------------------------------------------------------------
 
-# _CHARS_PER_TOKEN == 3.5，所以一条 N*3.5 个字符的消息估算约为 N 个 token。
+# _TEXT_BYTES_PER_TOKEN == 4.0，所以一条 N*4 个 ASCII 字节的消息估算约为 N 个 token。
 def _user(text_tokens: int) -> Message:
-    return Message(role="user", content="u" * int(text_tokens * _CHARS_PER_TOKEN))
+    return Message(role="user", content="u" * int(text_tokens * _TEXT_BYTES_PER_TOKEN))
 
 
 def _assistant(text_tokens: int) -> Message:
-    return Message(role="assistant", content="a" * int(text_tokens * _CHARS_PER_TOKEN))
+    return Message(role="assistant", content="a" * int(text_tokens * _TEXT_BYTES_PER_TOKEN))
 
 
 class TestComputeKeepStartIndex:
@@ -556,7 +555,7 @@ def _make_long_conversation(n_tail: int = 6, tail_tokens: int = 4000) -> Convers
     # 一些可区分的、最近的尾部消息，我们将断言它们会原文保留下来。
     for i in range(n_tail):
         conv.history.append(
-            Message(role="user", content=f"RECENT_{i}_" + "z" * int(tail_tokens * _CHARS_PER_TOKEN))
+            Message(role="user", content=f"RECENT_{i}_" + "z" * int(tail_tokens * _TEXT_BYTES_PER_TOKEN))
         )
     return conv
 

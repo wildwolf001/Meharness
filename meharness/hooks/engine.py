@@ -27,6 +27,10 @@ class HookEngine:
         self.hooks: list[Hook] = hooks or []
         self._prompt_messages: list[str] = []
         self._notifications: list[HookNotification] = []
+        # fire-and-forget 的异步 hook 任务集合：跟踪它们以便 wait_pending_async /
+        # 关闭时清理。之前 ensure_future 后不保留引用，子进程会泄漏到下一个
+        # 事件循环/测试，Windows 上关闭 loop 时挂死。
+        self._async_tasks: set[asyncio.Task] = set()
 
 
     def find_matching_hooks(self, event: str, ctx: HookContext) -> list[Hook]:
@@ -47,9 +51,20 @@ class HookEngine:
         for hook in matched:
             hook.mark_executed()
             if hook.async_exec:
-                asyncio.ensure_future(self._run_single(hook, ctx))
+                task = asyncio.ensure_future(self._run_single(hook, ctx))
+                self._async_tasks.add(task)
+                task.add_done_callback(self._async_tasks.discard)
             else:
                 await self._run_single(hook, ctx)
+
+    async def wait_pending_async(self) -> None:
+        """等待所有 fire-and-forget 的异步 hook 完成（测试收尾 / 关闭时调用）。
+
+        否则异步 hook 的子进程会跨测试/跨循环泄漏，Windows 上事件循环关闭时挂死。
+        """
+        pending = [t for t in self._async_tasks if not t.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
 
     async def _run_single(self, hook: Hook, ctx: HookContext) -> None:

@@ -147,17 +147,6 @@ class TeamManager:
         team.set_member_active(member_name, False)
         team.save()
 
-        mailbox = self.get_mailbox(team_name)
-        if mailbox:
-            msg = create_message(
-                from_agent=member_name,
-                to_agent=team.lead_agent_id,
-                content=f"Teammate '{member_name}' is now idle (run_to_completion finished).",
-                summary=f"{member_name} idle",
-                message_type="text",
-            )
-            mailbox.write(team.lead_agent_id, msg)
-
     def register_inprocess_handle(self, agent_id: str, handle: InProcessTeammateHandle) -> None:
         self._inprocess_handles[agent_id] = handle
 
