@@ -1,4 +1,4 @@
-# markdown → Seg 渲染器测试（观感对齐 claude-code）。
+# markdown → Seg 渲染器测试（观感参考 claude-code）。
 
 from __future__ import annotations
 

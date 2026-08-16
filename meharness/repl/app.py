@@ -95,7 +95,7 @@ _OVERLAY_TIMEOUT = 120
 # 0.1s 全屏重绘风暴（CPU 打满 + 屏幕狂闪）。
 _TOOL_SPINNER_MAX_SECONDS = 180
 
-# 工具执行 spinner 帧（对齐 claude：执行期间动词转帧）
+# 工具执行 spinner 帧（参考 claude：执行期间动词转帧）
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
@@ -244,7 +244,7 @@ class ReplApp:
         # 走可能挂秒级的 os.listdir（网络盘/大目录）。
         self._dir_cache: dict[str, tuple[float, list[str]]] = {}
 
-        # 记忆去重 + 近期工具（对齐 claude sideQuery 的 already_surfaced/recent_tools）
+        # 记忆去重 + 近期工具（参考 claude sideQuery 的 already_surfaced/recent_tools）
         self._surfaced_memories: set[str] = set()
         self._recent_tools: list[str] = []
         # 记忆预取防抖：同一时刻至多一个 side LLM 请求在跑，避免与主响应抢连接
@@ -282,7 +282,7 @@ class ReplApp:
         self.stream.commit_text(f"  model: {self._selected_provider.model}")
         self._render_input()
 
-        # 会话启动记忆预取（对齐 claude：首条消息前就 prefetch，后台非阻塞预热）
+        # 会话启动记忆预取（参考 claude：首条消息前就 prefetch，后台非阻塞预热）
         if self.memory_manager is not None and self._selected_provider is not None:
             asyncio.create_task(self._session_prefetch())
 
@@ -485,7 +485,7 @@ class ReplApp:
         if restored:
             self.agent.work_dir = restored.worktree_path
 
-        # worktree 工具 + /worktree 命令（对齐 claude，旧 Textual app.py:831-837）
+        # worktree 工具 + /worktree 命令（参考 claude，旧 Textual app.py:831-837）
         from meharness.tools.enter_worktree import EnterWorktreeTool
         from meharness.tools.exit_worktree import ExitWorktreeTool
         from meharness.commands.handlers.worktree import create_worktree_command
@@ -517,7 +517,7 @@ class ReplApp:
         self.trace_manager = TraceManager()
         self.task_manager = TaskManager()
 
-        # /tasks + /trace 命令（对齐 claude，旧 Textual app.py:913-918）
+        # /tasks + /trace 命令（参考 claude，旧 Textual app.py:913-918）
         from meharness.commands.handlers.tasks import create_tasks_command
         from meharness.commands.handlers.trace import create_trace_command
 
@@ -650,7 +650,7 @@ class ReplApp:
         parts.append(f"{elapsed}s")
         self.stream.set_status(" · ".join(parts), render=render)
 
-        # 接近上下文窗口时一次性告警横幅（对齐 claude TokenWarning）
+        # 接近上下文窗口时一次性告警横幅（参考 claude TokenWarning）
         if not self._token_warned and self.agent.total_input_tokens > int(
             (self.agent.context_window or 200_000) * 0.8
         ):
@@ -745,7 +745,7 @@ class ReplApp:
             return
         if self._streaming:
             if key == ("ctrl_c",) or key == ("escape",):
-                # Esc 也是中断（对齐 claude-code：Esc 打断当前响应）。
+                # Esc 也是中断（参考 claude-code：Esc 打断当前响应）。
                 # 仅在输入框为空时中断，避免误伤正在编辑的内容。
                 if key == ("escape",) and self._input_text:
                     self._input_text = ""
@@ -1125,7 +1125,7 @@ class ReplApp:
         assert self.agent is not None
         self._streaming = True
         if text:
-            # 用户消息：灰 ❯ + 整块底色（对齐 claude）
+            # 用户消息：灰 ❯ + 整块底色（参考 claude）
             self.stream.append_block(
                 [Seg("❯ ", fg=fg256(246)), Seg(text, bg=bg256(237))]
             )
@@ -1133,7 +1133,7 @@ class ReplApp:
             if self.session:
                 self.session.append(Message(role="user", content=text))
 
-        # 记忆预取：非阻塞（对齐 claude-code 的 startRelevantMemoryPrefetch——
+        # 记忆预取：非阻塞（参考 claude-code 的 startRelevantMemoryPrefetch——
         # 后台跑，永不阻塞主响应。settle 后在 agent 迭代间注入；本轮没用上就放弃，
         # 下轮会为新消息重新预取）。之前是 await wait_for(..., 3s) 阻塞，每条消息
         # 都要先干等记忆选择再开始响应，体验上"极其缓慢"。
@@ -1183,7 +1183,7 @@ class ReplApp:
                     self._awaiting_first_byte = False
                     self._working_verb = ""
                     if self._stream_block is None:
-                        # 首字节才建块，带回合步号（对齐 claude 的 Step n）
+                        # 首字节才建块，带回合步号（参考 claude 的 Step n）
                         self._turn_no += 1
                         self._stream_block = self.stream.append_block(
                             [
@@ -1222,7 +1222,7 @@ class ReplApp:
                     )
                 except Exception:
                     pass
-            # 中断时补齐悬空的 tool_use→tool_result 配对（对齐 claude-code
+            # 中断时补齐悬空的 tool_use→tool_result 配对（参考 claude-code
             # yieldMissingToolResultBlocks）：否则 resume 后对话含"assistant 发了
             # tool_use 却没 tool_result"的非法序列，状态不一致。
             try:
@@ -1239,7 +1239,7 @@ class ReplApp:
             self._stop_tool_spinner()
             ticker_task.cancel()
             self._render_input()
-            # 预取本轮没用上且还没跑完：取消，避免后台任务泄漏（对齐 claude-code
+            # 预取本轮没用上且还没跑完：取消，避免后台任务泄漏（参考 claude-code
             # 的 MemoryPrefetch 在生成器退出时 dispose）。
             if (
                 prefetch_task is not None
@@ -1314,7 +1314,7 @@ class ReplApp:
         """把当前回合流式累计的纯文本重排成带样式的 markdown 块。
 
         回合结束（TurnComplete / LoopComplete）时调用一次：标题加粗、代码块
-        底色、行内代码变色、粗斜体等，观感对齐 claude-code。已排过（无文本）
+        底色、行内代码变色、粗斜体等，观感参考 claude-code。已排过（无文本）
         则跳过。
         """
         if self._stream_block is not None and self._turn_text:
@@ -1359,7 +1359,7 @@ class ReplApp:
                 self._recent_tools.append(event.tool_name)
             if len(self._recent_tools) > 20:
                 self._recent_tools = self._recent_tools[-20:]
-            # 工具行 spinner（对齐 claude：执行期间动词+转帧）
+            # 工具行 spinner（参考 claude：执行期间动词+转帧）
             self._active_tool_blocks[event.tool_id] = (block_id, verb)
             self._ensure_tool_spinner()
         elif isinstance(event, ToolResultEvent):
@@ -1382,12 +1382,12 @@ class ReplApp:
                 self._tool_spinner_timer = None
         elif isinstance(event, TurnComplete):
             # 回合结束：把该回合的流式纯文本重排成带样式的 markdown 块
-            # （标题加粗/代码块底色/行内代码变色，对齐 claude 观感），再终结。
+            # （标题加粗/代码块底色/行内代码变色，参考 claude 观感），再终结。
             self._finalize_stream_block()
             # 关键：重置回合文本累加。否则下一回合的 StreamText 会累积到旧文本上，
             # finalize 时把"旧+新"整段重排进新块 → 每步回复开头重复上一段。
             self._turn_text = ""
-            # 下一回合文本开新块（对齐 claude 每步一段）
+            # 下一回合文本开新块（参考 claude 每步一段）
             self._stream_block = None
             if self.session:
                 for msg in self.conversation.history[history_cursor:]:
@@ -1435,7 +1435,7 @@ class ReplApp:
         return history_cursor
 
     # ------------------------------------------------------------------
-    # Overlay 基础设施（对齐 claude 交互层）
+    # Overlay 基础设施（参考 claude 交互层）
     # ------------------------------------------------------------------
 
     def _open_overlay(self, ov) -> None:
@@ -1583,7 +1583,7 @@ class ReplApp:
     # ------------------------------------------------------------------
 
     async def _prompt_permission(self, event: PermissionRequest) -> None:
-        # 对齐 claude 权限面板：展示工具 + 参数，内联允许/始终/拒绝/编辑
+        # 参考 claude 权限面板：展示工具 + 参数，内联允许/始终/拒绝/编辑
         ov = PermissionOverlay(event.tool_name, event.description, event.arguments)
         choice = await self._run_overlay(ov)
         if choice == "allow":
@@ -1618,7 +1618,7 @@ class ReplApp:
             options = q.get("options", [])
             multi = q.get("type") == "checkbox" or q.get("multiSelect", False)
             labels = [o.get("label", str(o)) if isinstance(o, dict) else str(o) for o in options]
-            # 焦点化选择面板（对齐 claude AskUserQuestion）
+            # 焦点化选择面板（参考 claude AskUserQuestion）
             ov = AskUserOverlay(header, labels, bool(multi))
             choice = await self._run_overlay(ov)
             if choice is None:
@@ -1648,7 +1648,7 @@ class ReplApp:
                 plan_content = plan_path.read_text(encoding="utf-8")
             except Exception:
                 pass
-        # 对齐 claude plan 对话框：计划全文 + 焦点选择
+        # 参考 claude plan 对话框：计划全文 + 焦点选择
         ov = PlanOverlay(plan_content)
         choice = await self._run_overlay(ov)
         choice = choice if choice is not None else 2

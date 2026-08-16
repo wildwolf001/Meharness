@@ -1,4 +1,4 @@
-"""TUI overlay 交互层（观感对齐 Claude Code）。
+"""TUI overlay 交互层（观感参考 Claude Code）。
 
 Overlay 渲染由 FullscreenScreen 覆写内容区完成；本模块提供具体 overlay 与
 纯函数（供单测）。按键路由：ReplApp._handle_key 优先把按键交给栈顶 overlay，
@@ -379,7 +379,7 @@ class BannerOverlay(Overlay):
 
 
 # ---------------------------------------------------------------------------
-# 工具执行动词（对齐 claude getActivityDescription）
+# 工具执行动词（参考 claude getActivityDescription）
 # ---------------------------------------------------------------------------
 
 def tool_verb(name: str, args: dict[str, Any] | None = None) -> str:

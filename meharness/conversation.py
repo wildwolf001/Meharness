@@ -34,7 +34,7 @@ class Message:
     thinking_blocks: list[ThinkingBlock] = field(default_factory=list)
 
 
-# 本地 token 估算比率，对齐 claude-code 的 roughTokenCountEstimation
+# 本地 token 估算比率，参考 claude-code 的 roughTokenCountEstimation
 # （services/tokenEstimation.ts）：普通文本按 UTF-8 字节数/4，JSON（工具参数）
 # 按字节数/2。字节基准天然对 CJK 更准（中文每字 3 字节 → 0.75 token/字）。
 _TEXT_BYTES_PER_TOKEN = 4.0
@@ -159,7 +159,7 @@ class ConversationManager:
     def synthesize_interrupted_tool_results(self) -> None:
         """中断时补齐 conversation 中悬空的 tool_use → tool_result 配对。
 
-        对齐 claude-code 的 yieldMissingToolResultBlocks / StreamingToolExecutor
+        参考 claude-code 的 yieldMissingToolResultBlocks / StreamingToolExecutor
         getRemainingResults：用户打断正在执行工具的回合时，已经 y 出的 assistant
         tool_use 必须有一条 user tool_result 承接，否则 resume 后 API 会收到
         "assistant 发了 tool_use 却没有 tool_result" 的非法序列，模型也看不到

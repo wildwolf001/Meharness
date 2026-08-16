@@ -1496,7 +1496,7 @@ class MeharnessApp(App):
                         f"✻ {_to_past_tense(self._thinking_verb)} "
                         f"for {total_time:.1f}s"
                     )
-                    # 轻量 token 反馈（对齐 claude-code 的用量展示，不硬编码成本）
+                    # 轻量 token 反馈（参考 claude-code 的用量展示，不硬编码成本）
                     if self.agent:
                         done_text += (
                             f"  (in {_fmt_k(self.agent.total_input_tokens)}"
@@ -1542,7 +1542,7 @@ class MeharnessApp(App):
                 await ai_row.mount(md)
                 self._register_block(md, accumulated_text + "\n\n*[cancelled]*")
                 # 状态保留：把被打断的部分回复写进会话，下一轮能基于它续接，
-                # 而不是当什么都没发生过（参照 claude-code 的优雅中断）。
+                # 而不是当什么都没发生过（参考 claude-code 的优雅中断）。
                 try:
                     if self.conversation is not None:
                         self.conversation.add_assistant_message(

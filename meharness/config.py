@@ -35,7 +35,7 @@ class ProviderConfig:
     model: str
     api_key: str = ""
     thinking: bool = False
-    # thinking budget（0=未设置 → 用模型默认/上限）。对齐 claude 的能力声明机制。
+    # thinking budget（0=未设置 → 用模型默认/上限）。参考 claude 的能力声明机制。
     thinking_budget: int = 0
     # 0 表示"未设置" — get_context_window() 通过四层 fallback 解析真实窗口大小。
     # 正数表示配置文件里显式指定的覆盖值。
@@ -53,7 +53,7 @@ class ProviderConfig:
         return os.environ.get(env_var, "")
 
     def model_supports_thinking(self) -> bool:
-        """模型是否声明支持 extended thinking（对齐 Claude Code 的能力声明机制）。
+        """模型是否声明支持 extended thinking（参考 Claude Code 的能力声明机制）。
 
         声明来源（任一）：config.yaml 的 ``thinking: true``，或环境变量
         ``MEHARNESS_MODEL_SUPPORTED_CAPABILITIES``（逗号分隔，含 ``thinking``）。

@@ -815,7 +815,7 @@ class TestThinkingCollapse:
 
 
 # ---------------------------------------------------------------------------
-# 中断合成缺失 tool_result（P1-5：对齐 claude yieldMissingToolResultBlocks）
+# 中断合成缺失 tool_result（P1-5：参考 claude yieldMissingToolResultBlocks）
 # ---------------------------------------------------------------------------
 
 class TestSynthesizeInterruptedToolResults:
@@ -851,7 +851,7 @@ class TestSynthesizeInterruptedToolResults:
 
 
 # ---------------------------------------------------------------------------
-# 旧回合 assistant 文本精简（对齐 claude microcompact：上下文满得快的根因）
+# 旧回合 assistant 文本精简（参考 claude microcompact：上下文满得快的根因）
 # ---------------------------------------------------------------------------
 
 class TestSnipOldAssistantText:

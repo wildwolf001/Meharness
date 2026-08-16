@@ -31,7 +31,7 @@ KEEP_RECENT_TURNS = 10
 OLD_RESULT_SNIP_CHARS = 2_000
 SNIPPED_TAG = "<snipped>"
 
-# 旧回合 assistant 正文精简（对齐 claude microcompact）：DeepSeek 单回合输出
+# 旧回合 assistant 正文精简（参考 claude microcompact）：DeepSeek 单回合输出
 # 8k~64k，旧回合的模型回复一字不差全量重发是上下文膨胀主凶——tool_result 有预算、
 # assistant 文本没有。超过该长度时保留头部 + 标记，模型无需逐字读自己的旧回复。
 OLD_ASSISTANT_SNIP_CHARS = 3_000
@@ -40,7 +40,7 @@ SUMMARY_OUTPUT_RESERVE = 20_000
 AUTO_COMPACT_SAFETY_MARGIN = 13_000
 MANUAL_COMPACT_SAFETY_MARGIN = 3_000
 
-# Layer 2 "保留近期原文"窗口（对应 Claude Code compact.ts 的
+# Layer 2 "保留近期原文"窗口（参考 Claude Code compact.ts 的
 # buildPostCompactMessages messagesToKeep）。压缩时，尾部消息按 token 累计不超过
 # KEEP_RECENT_TOKENS、或消息数不少于 MIN_KEEP_MESSAGES（取先满足的条件保底）保留原文，
 # 不纳入摘要。累计超过 KEEP_MAX_TOKENS 时停止，防止单条超大消息吞掉整个窗口。
@@ -360,7 +360,7 @@ def _snip_stale_messages(
             continue
 
         # 旧回合：裁剪 assistant 正文 + tool 结果 + 截断 tool 调用参数
-        # （WriteFile 大内容）。assistant 文本精简是对齐 claude microcompact——
+        # （WriteFile 大内容）。assistant 文本精简是参考 claude microcompact——
         # 模型无需逐字重读自己旧回合的冗长回复，保留头部即可。
         new_results: list[ToolResultBlock] = []
         results_changed = False

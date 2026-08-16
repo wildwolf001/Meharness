@@ -1,4 +1,4 @@
-"""FullscreenScreen —— 自研全屏重绘 TUI 渲染器（观感对齐 Claude Code）。
+"""FullscreenScreen —— 自研全屏重绘 TUI 渲染器（观感参考 Claude Code）。
 
 模型：
 - ``Seg``：一段带样式的文本（fg/bg/attrs 存 ANSI 码），宽度按纯文本 CJK 2 格算。
@@ -194,10 +194,10 @@ def parse_ansi(text: str) -> list[Seg]:
 # ---------------------------------------------------------------------------
 
 class Overlay:
-    """内容区之上的一层临时 UI（面板/横幅），对齐 Claude Code 的交互层。
+    """内容区之上的一层临时 UI（面板/横幅），参考 Claude Code 的交互层。
 
     渲染：``lines(width)`` 返回要覆写到内容区的行；``anchor_top`` 决定从哪行
-    开始。**交互面板默认贴底**（紧靠输入框上方/上下文末尾，对齐 claude 的
+    开始。**交互面板默认贴底**（紧靠输入框上方/上下文末尾，参考 claude 的
     命令面板和 AskUserQuestion 就地弹出），横幅（``centered()`` 返回 False）
     锚顶。按键优先路由给栈顶 overlay（``on_key`` 返回 True 表示消费）。
     overlay 行不进 buffer，滚动/选区不受影响。

@@ -561,7 +561,7 @@ class Agent:
             if _new_records:
                 append_replacement_records(self.session_dir, _new_records)
 
-            # 兜底重试（对齐 claude-code withRetry）：
+            # 兜底重试（参考 claude-code withRetry）：
             # - 瞬时错误（限流/网络/5xx）指数退避重试，不直接终止回合
             # - 上下文超窗（413）→ 自动压缩后重试
             from meharness.client import is_context_overflow_error
@@ -650,7 +650,7 @@ class Agent:
                 if not max_tokens_escalated:
                     # 首次撞顶：同请求升级到 64k 重试，不追加任何消息——对话未变，
                     # 下一轮重建 api_conv 即等价于"同请求以更高上限重发"。
-                    # 对应 claude-code query.ts 的 tengu_max_tokens_escalate。
+                    # 参考 claude-code query.ts 的 tengu_max_tokens_escalate。
                     self.client.set_max_output_tokens(MAX_TOKENS_CEILING)
                     max_tokens_escalated = True
                     yield RetryEvent(reason="max_tokens escalate to 64k (same request)")
@@ -660,7 +660,7 @@ class Agent:
                     # 64k 仍撞顶：保留部分 assistant 输出（文本 + 思考 + 已完成的
                     # tool_calls，response.tool_calls 里的都是 JSON 完整解析成功的），
                     # 让模型看到自己写到一半的内容再续写。
-                    # 对应 claude-code query.ts 的 max_output_tokens_recovery。
+                    # 参考 claude-code query.ts 的 max_output_tokens_recovery。
                     partial_tool_uses = [
                         ToolUseBlock(
                             tool_use_id=tc.tool_id,
@@ -685,7 +685,7 @@ class Agent:
             else:
                 output_recoveries = 0
 
-            # 空响应恢复（对齐 claude-code 流式空事件检测）：无文本、无工具调用
+            # 空响应恢复（参考 claude-code 流式空事件检测）：无文本、无工具调用
             # → 模型空转了（DeepSeek thinking 吃光 budget / API 异常），重试并
             # 提示直接行动，避免"跑一回合就停、没有最终输出"。
             if (
@@ -1434,7 +1434,7 @@ class Agent:
             persist_tool_result,
         )
 
-        # 超过内联上限即全量落盘 + 给路径预览（对应 claude-code 的
+        # 超过内联上限即全量落盘 + 给路径预览（参考 claude-code 的
         # persistedOutputPath 策略）。模型可 ReadFile 读取文件里的完整内容
         # （含尾部错误/测试输出），而不是只看被截断的头部。
         if len(text) > MAX_OUTPUT_CHARS:

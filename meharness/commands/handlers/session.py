@@ -74,7 +74,7 @@ async def handle_session(ctx: CommandContext) -> None:
         if ctx.agent:
             ctx.agent._loop_count = 0
         await ctx.config["render_restored"](result.messages)
-        # 恢复时展示上次会话摘要，让续接有上下文（对齐 claude-code /resume 体验）
+        # 恢复时展示上次会话摘要，让续接有上下文（参考 claude-code /resume 体验）
         if getattr(result.session.meta, "summary", ""):
             ctx.ui.add_system_message(
                 f"上次进度: {result.session.meta.summary}"

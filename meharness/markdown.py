@@ -1,4 +1,4 @@
-"""轻量 markdown → Seg 渲染（观感对齐 claude-code 的 Markdown 组件）。
+"""轻量 markdown → Seg 渲染（观感参考 claude-code 的 Markdown 组件）。
 
 流式期间以纯文本呈现（update_block_append 增量续写，保证流畅）；回合结束
 （TurnComplete）时用 render_markdown 把该回合全文重排成带样式的块：

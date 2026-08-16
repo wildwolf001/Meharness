@@ -213,7 +213,7 @@ class AnthropicClient(LLMClient):
 
         if self.thinking:
             if self.thinking_budget > 0:
-                # 显式声明 budget：直接用它（对齐 claude 能力声明 + budget 控制）
+                # 显式声明 budget：直接用它（参考 claude 能力声明 + budget 控制）
                 kwargs["thinking"] = {
                     "type": "enabled",
                     "budget_tokens": self.thinking_budget,
@@ -501,7 +501,7 @@ class OpenAICompatClient(LLMClient):
 
         try:
             # 流式优先；首字节超时/空响应（未产出任何内容）→ 非流式兜底
-            # （对齐 claude-code：流式失败回退一次性请求，规避兼容层流式怪癖）。
+            # （参考 claude-code：流式失败回退一次性请求，规避兼容层流式怪癖）。
             yielded_any = False
             try:
                 async for ev in self._stream_events(kwargs):

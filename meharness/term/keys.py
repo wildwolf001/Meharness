@@ -161,7 +161,7 @@ class KeyReader:
     def _enable_windows_vt(self) -> bool:
         """启用控制台 VT 输入模式 + 去行缓冲/回显 + 去 Ctrl+C 信号化。
 
-        对齐 claude-code：直接读 stdin 原始字节，键盘+鼠标 SGR 一起收。
+        参考 claude-code：直接读 stdin 原始字节，键盘+鼠标 SGR 一起收。
         保存旧模式供 restore。失败返回 False（调用方退回 msvcrt）。
 
         关键：同时清除 ENABLE_PROCESSED_INPUT(0x0001)——否则 Ctrl+C 会生成
