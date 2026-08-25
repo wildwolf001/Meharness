@@ -1,7 +1,5 @@
 # Meharness
 
-> 一只会写代码的猫，你的终端 AI 编程助手 🐱
-
 Meharness 是一个运行在终端里的 AI 编程助手，支持多 LLM 提供商、MCP 协议、子 Agent 调度、Agent 团队协作等能力。灵感来源于 Claude Code，使用 Python + Textual 构建 TUI 交互界面。
 
 ## 功能特性
